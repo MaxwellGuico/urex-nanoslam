@@ -16,6 +16,13 @@
 #include "esp_log.h"
 
 static const char *TAG = "vl53_io";
+#ifdef CONFIG_VL53L5CX_MUXED_BUS
+/* Shared by all per-channel driver instances; access only under bus_mutex. */
+static i2c_master_dev_handle_t s_selected_mux;
+static uint8_t s_selected_channel=UINT8_MAX;
+void VL53L5CX_InvalidateMuxCache(void)
+{ s_selected_mux=NULL; s_selected_channel=UINT8_MAX; }
+#endif
 
 /* The ST API exposes an eight-bit platform status, whereas ESP-IDF uses the
  * wider esp_err_t namespace (for example ESP_ERR_INVALID_RESPONSE is 0x108).
@@ -67,6 +74,9 @@ static uint8_t vl53l5cx_platform_begin(VL53L5CX_Platform *p_platform,
                                        register_address, ESP_FAIL);
     }
 
+    if (s_selected_mux == p_platform->mux_handle &&
+        s_selected_channel == p_platform->mux_channel) return 0U;
+
     const uint8_t channel_mask =
         (uint8_t)(1U << p_platform->mux_channel);
     const esp_err_t err = i2c_master_transmit(
@@ -75,11 +85,14 @@ static uint8_t vl53l5cx_platform_begin(VL53L5CX_Platform *p_platform,
         sizeof(channel_mask),
         VL53L5CX_I2C_TIMEOUT);
     if (err != ESP_OK) {
+        VL53L5CX_InvalidateMuxCache();
         xSemaphoreGive(p_platform->bus_mutex);
         return vl53l5cx_platform_error(p_platform, operation,
                                        register_address, err);
     }
 
+    s_selected_mux=p_platform->mux_handle;
+    s_selected_channel=p_platform->mux_channel;
     return 0U;
 }
 
@@ -133,6 +146,7 @@ uint8_t VL53L5CX_WrMulti(VL53L5CX_Platform *p_platform, uint16_t RegisterAdress,
             i2c_buffers,
             2,
             VL53L5CX_I2C_TIMEOUT);
+        if (err != ESP_OK) VL53L5CX_InvalidateMuxCache();
         vl53l5cx_platform_end(p_platform);
         if (err != ESP_OK) {
             return vl53l5cx_platform_error(p_platform, "write",
@@ -179,6 +193,7 @@ uint8_t VL53L5CX_RdMulti(VL53L5CX_Platform *p_platform, uint16_t RegisterAdress,
         p_values,
         size,
         VL53L5CX_I2C_TIMEOUT);
+    if (err != ESP_OK) VL53L5CX_InvalidateMuxCache();
     vl53l5cx_platform_end(p_platform);
     return err == ESP_OK ? 0U : vl53l5cx_platform_error(
         p_platform, "read", RegisterAdress, err);

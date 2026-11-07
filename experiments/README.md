@@ -102,22 +102,19 @@ idf.py --version
 The wrapper saves every build terminal under `run-logs/builds/` and creates a sibling `.evidence`
 directory containing the exact Git/configuration snapshot and build hashes. This evidence may
 contain Wi-Fi credentials copied from `sdkconfig`; keep it private or scrub secrets before sharing.
-Connect the PX4 telemetry link and ESP32-S3, then give the wrapper the actual ToF power condition for
-the hardware run:
+Connect the PX4 telemetry link and ESP32-S3, then flash and capture the hardware run:
 
 ```bash
-./scripts/idf_logged.sh --power external -p /dev/ttyACM0 flash monitor
-# Or, without an external ToF supply:
-./scripts/idf_logged.sh --power no-external -p /dev/ttyACM0 flash monitor
+./scripts/idf_logged.sh -p /dev/ttyACM0 flash monitor
 ```
 
 Press `Ctrl+]` to stop the monitor. Do not disconnect or move the drone until at least one `NANOMAP`
 record has appeared after the experiment. Map records are emitted every 10 seconds in bench mode.
 
-Monitor logs are automatically placed in `run-logs/with-external-tof-power/` or
-`run-logs/without-external-tof-power/`. These routine logs are ignored by Git. After checking a run,
-copy the useful log into the matching `experiments/` directory with a descriptive, dated filename
-so it becomes part of the preserved review evidence.
+Monitor logs are automatically placed in `run-logs/hardware/`. These routine logs
+are ignored by Git. After checking a run, copy the useful log into `experiments/`
+with a descriptive, dated filename so it becomes part of the preserved review
+evidence. Historical power-comparison logs remain in their original subdirectories.
 
 If the firmware is already flashed, omit the `flash` command and capture a new monitor log after
 resetting the board.

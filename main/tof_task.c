@@ -1,4 +1,5 @@
 #include "tof_task.h"
+#include "mavlink_task.h"
 
 #include "vl53l5cx_api.h"
 #include "platform.h"
@@ -17,6 +18,7 @@
 #include <float.h>
 
 static const char *TAG = "tof";
+_Static_assert(VL53L5CX_NB_TARGET_PER_ZONE==1, "Ring acquisition requires one target per zone");
 
 // ---------------------------------------------------------------------------
 // Sensor angle table (body frame, degrees, CW from forward)
@@ -29,6 +31,9 @@ static float SENSOR_ANGLES[TOF_SENSOR_COUNT];
 // ---------------------------------------------------------------------------
 static tof_scan_t    s_scan;
 static SemaphoreHandle_t s_scan_mutex;
+static QueueHandle_t s_records;
+static uint32_t s_record_drops, s_sequences[TOF_SENSOR_COUNT];
+static uint64_t s_not_ready[TOF_SENSOR_COUNT];
 
 // ---------------------------------------------------------------------------
 // I2C / hardware handles (private to this file)
@@ -73,6 +78,7 @@ static void publish_sensor_lifecycle(uint8_t sensor, bool configured,
     s_sensor_ok[sensor] = 0U;
     s_scan.sensor_ok[sensor] = 0U;
     s_scan.frame[sensor].valid = 0U;
+    s_not_ready[sensor] = 0;
     s_last_frame_ms[sensor] = ranging ? now_ms : 0U;
     s_ring_frame_ready_reported = false;
     xSemaphoreGive(s_scan_mutex);
@@ -89,29 +95,28 @@ static bool sensor_is_pollable(uint8_t sensor)
 // ---------------------------------------------------------------------------
 // Compute minimum range (metres) from a stored tof_frame_t.
 //
-// Status 5/9: valid measurement — use reported distance.
-// Status 255: out of range (nothing there) — ignored.
-// Any other status: unreliable — treat as 0.3 m (conservative).
+// Status 255: no target detected — ignored.
+// Any other status: use the reported distance. Status 5/9 are fully valid;
+// lower-confidence returns (e.g. status 10, "no target at previous range",
+// which appears in most frames) still count if they report something close,
+// so the obstacle check stays conservative without inventing a range.
+// Previously non-5/9 zones were forced to 0.30 m, which made every status-10
+// zone abort the mission even when it measured 2 m. Sensor loss is covered
+// separately by the freshness check.
 // Returns INFINITY only if every pixel is status 255 or out-of-range.
 // ---------------------------------------------------------------------------
 static float frame_min_range_m(const tof_frame_t *f)
 {
     float min_m = INFINITY;
-    for (int row = 4; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            int      i      = row * 8 + col;
+    for (int row = TOF_NATIVE_SIDE / 2; row < TOF_NATIVE_SIDE; row++) {
+        for (int col = 0; col < TOF_NATIVE_SIDE; col++) {
+            int      i      = row * TOF_NATIVE_SIDE + col;
             uint8_t  status = f->target_status[i];
             int16_t  dist   = f->distance_mm[i];
 
-            float m;
-            if (status == 255) {
-                continue;
-            } else if (status == 5 || status == 9) {
-                if (dist < TOF_MIN_VALID_MM || dist > TOF_MAX_VALID_MM) continue;
-                m = (float)dist / 1000.0f;
-            } else {
-                m = 0.30f;
-            }
+            if (status == 255) continue;
+            if (dist < TOF_MIN_VALID_MM || dist > TOF_MAX_VALID_MM) continue;
+            float m = (float)dist / 1000.0f;
             if (m < min_m) min_m = m;
         }
     }
@@ -137,18 +142,26 @@ static bool configure_sensor(uint8_t idx)
         return false;
     }
 
-    if (vl53l5cx_set_ranging_frequency_hz(dev, TOF_RANGING_FREQ_HZ)) {
-        ESP_LOGE(TAG, "[%d] set freq failed", idx);
+    if (vl53l5cx_set_resolution(dev, TOF_NATIVE_PIXELS) ||
+        vl53l5cx_set_ranging_mode(dev, VL53L5CX_RANGING_MODE_AUTONOMOUS) ||
+        vl53l5cx_set_integration_time_ms(dev, TOF_INTEGRATION_MS) ||
+        vl53l5cx_set_ranging_frequency_hz(dev, TOF_RANGING_FREQ_HZ)) {
+        ESP_LOGE(TAG, "[%d] profile configuration failed", idx);
         return false;
     }
-
-    if (vl53l5cx_set_resolution(dev, VL53L5CX_RESOLUTION_8X8)) {
-        ESP_LOGE(TAG, "[%d] set resolution failed", idx);
+    uint8_t resolution=0, frequency=0, mode=0;
+    uint32_t integration=0;
+    if (vl53l5cx_get_resolution(dev,&resolution) ||
+        vl53l5cx_get_ranging_frequency_hz(dev,&frequency) ||
+        vl53l5cx_get_ranging_mode(dev,&mode) ||
+        vl53l5cx_get_integration_time_ms(dev,&integration) ||
+        resolution!=TOF_NATIVE_PIXELS || frequency!=TOF_RANGING_FREQ_HZ ||
+        mode!=VL53L5CX_RANGING_MODE_AUTONOMOUS || integration!=TOF_INTEGRATION_MS) {
+        ESP_LOGE(TAG,"[%d] profile readback mismatch",idx);
         return false;
     }
-
-    ESP_LOGI(TAG, "[%d] configured — %.0f° @ %dHz 8x8",
-             idx, SENSOR_ANGLES[idx], TOF_RANGING_FREQ_HZ);
+    ESP_LOGI(TAG, "[%d] configured — %.0f° @ %dHz %dx%d, autonomous, integration=5ms",
+             idx, SENSOR_ANGLES[idx], TOF_RANGING_FREQ_HZ, TOF_NATIVE_SIDE, TOF_NATIVE_SIDE);
     return true;
 }
 
@@ -247,6 +260,7 @@ static void tof_recovery_task(void *arg)
         s_sensor_ok[sensor] = 0U;
         s_scan.sensor_ok[sensor] = 0U;
         s_scan.frame[sensor].valid = 0U;
+        s_not_ready[sensor]=0;
         s_last_reinit_ms[sensor] = end_ms;
         s_last_frame_ms[sensor] = recovered ? end_ms : 0U;
         s_ring_frame_ready_reported = false;
@@ -339,6 +353,8 @@ void tof_task_init(void)
         SENSOR_ANGLES[i] = (float)(((TOF_FRONT_SENSOR_IDX - i) * 45 % 360 + 360) % 360);
     }
 
+    s_records = xQueueCreate(64, sizeof(tof_record_t));
+    configASSERT(s_records != NULL);
     s_scan_mutex = xSemaphoreCreateMutex();
     configASSERT(s_scan_mutex != NULL);
     s_bus_mutex = xSemaphoreCreateMutex();
@@ -365,6 +381,16 @@ float tof_get_min_range_in_sector(float angle_min_deg, float angle_max_deg)
     return min_m;
 }
 
+bool tof_pop_record(tof_record_t *record)
+{ return xQueueReceive(s_records, record, 0) == pdTRUE; }
+uint32_t tof_record_drops(void)
+{
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    uint32_t drops=s_record_drops;
+    xSemaphoreGive(s_scan_mutex);
+    return drops;
+}
+
 tof_scan_t tof_get_scan(void)
 {
     xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
@@ -377,9 +403,9 @@ uint8_t tof_get_mapping_returns(
     uint16_t map_effective_range_mm,
     nanolite_tof_return_t returns[TOF_SENSOR_COUNT])
 {
-    if (returns == NULL) {
-        return 0;
-    }
+    if (returns == NULL) return 0;
+    memset(returns,0,sizeof(*returns)*TOF_SENSOR_COUNT);
+    if (TOF_NATIVE_SIDE != 8) return 0;
 
     nanolite_tof_config_t config = nanolite_default_tof_config();
     config.map_effective_range_mm = map_effective_range_mm;
@@ -493,14 +519,14 @@ tof_scan_collapsed_t tof_get_collapsed_scan(void)
         if (!snap.sensor_ok[s] || !snap.frame[s].valid) continue;
         const tof_frame_t *f = &snap.frame[s];
 
-        for (int col = 0; col < 8; col++) {
+        for (int col = 0; col < TOF_NATIVE_SIDE; col++) {
             /* Sensors right-side up: raw col 0 = RIGHT of FoV (from lens).
              * col 0 → +offset (CW), col 7 → −offset (CCW). */
-            float angle_deg = SENSOR_ANGLES[s] + (3.5f - (float)col) * (45.0f / 8.0f);
+            float angle_deg = SENSOR_ANGLES[s] + ((TOF_NATIVE_SIDE - 1) * 0.5f - (float)col) * (45.0f / TOF_NATIVE_SIDE);
 
             /* Rows 4-7 = physical upper half (sensors mounted upside-down) */
-            for (int row = 4; row < 8; row++) {
-                int      px     = row * 8 + col;
+            for (int row = TOF_NATIVE_SIDE / 2; row < TOF_NATIVE_SIDE; row++) {
+                int      px     = row * TOF_NATIVE_SIDE + col;
                 uint8_t  status = f->target_status[px];
                 int16_t  dist   = f->distance_mm[px];
 
@@ -595,6 +621,7 @@ void tof_task(void *arg)
             publish_sensor_lifecycle((uint8_t)i, configured, false, 0U);
             if (!configured) {
                 // Bus may be stuck — reset and give it a moment before next pass
+                VL53L5CX_InvalidateMuxCache();
                 const esp_err_t err = i2c_master_bus_reset(s_bus_handle);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG,
@@ -620,10 +647,6 @@ void tof_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    ESP_LOGI(TAG, "ToF frame transfer size: %lu bytes @ %d Hz",
-             (unsigned long)s_dev[0].data_read_size,
-             TOF_RANGING_FREQ_HZ);
-
     // ---- Start every configured channel once, in a bounded sequence ----
     // No channel is reported online yet. A channel becomes online only after
     // the polling loop receives its first complete frame.
@@ -636,6 +659,13 @@ void tof_task(void *arg)
             ranging_mask |= (uint8_t)(1U << i);
         }
     }
+    ESP_LOGI(TAG, "ToF transfer=%lu B/sensor frame; target=%d Hz; payload load >=%lu B/s on 400kHz bus",
+             (unsigned long)s_dev[0].data_read_size, TOF_RANGING_FREQ_HZ,
+             (unsigned long)(s_dev[0].data_read_size*TOF_SENSOR_COUNT*TOF_RANGING_FREQ_HZ));
+    const uint32_t wire_min_bps=s_dev[0].data_read_size*TOF_SENSOR_COUNT*TOF_RANGING_FREQ_HZ*9;
+    if (wire_min_bps>=TOF_MUX_I2C_SPEED_HZ)
+        ESP_LOGW(TAG,"Requested aggregate rate exceeds 400kHz even before mux/poll overhead: %lu bit/s minimum",
+                 (unsigned long)wire_min_bps);
     ESP_LOGI(TAG,
              "start sequence complete: configured_mask=0x%02x "
              "ranging_mask=0x%02x frame_ready_mask=0x00",
@@ -704,6 +734,7 @@ void tof_task(void *arg)
 
             // Reset the I2C bus (sends 9 SCL clocks to release a stuck SDA)
             xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+            VL53L5CX_InvalidateMuxCache();
             esp_err_t err = i2c_master_bus_reset(s_bus_handle);
             xSemaphoreGive(s_bus_mutex);
             if (err != ESP_OK) {
@@ -738,7 +769,9 @@ void tof_task(void *arg)
         // layer atomically selects this sensor's mux channel for each transfer.
         uint8_t is_ready = 0;
         VL53L5CX_Configuration *dev = &s_dev[sensor];
+        const uint64_t ready_before_us = esp_timer_get_time();
         uint8_t status = vl53l5cx_check_data_ready(dev, &is_ready);
+        const uint64_t ready_after_us = esp_timer_get_time();
         if (status) {
             ESP_LOGW(TAG, "[%d] check_data_ready status=%d", sensor, status);
             consecutive_fails++;
@@ -747,12 +780,32 @@ void tof_task(void *arg)
         }
 
         if (is_ready) {
+            const uint8_t ready_streamcount = dev->streamcount;
+            const uint64_t read_start_us = esp_timer_get_time();
             status = vl53l5cx_get_ranging_data(dev, &results);
+            const uint64_t read_end_us = esp_timer_get_time();
             if (status) {
                 ESP_LOGW(TAG, "[%d] get_ranging_data status=%d", sensor, status);
                 consecutive_fails++;
             } else {
-                now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                now_ms = (uint32_t)(read_end_us / 1000);
+                tof_record_t record = {
+                    .sensor=sensor, .streamcount=dev->streamcount,
+                    .changed_during_read=ready_streamcount!=dev->streamcount,
+                    .sequence=++s_sequences[sensor],
+                    .ready_before_us=ready_before_us, .ready_after_us=ready_after_us,
+                    .read_start_us=read_start_us, .read_end_us=read_end_us,
+                    /* If a new result arrived during readout, the previous poll
+                     * cannot bound this result. Never claim that bound. */
+                    .previous_not_ready_us=ready_streamcount==dev->streamcount ? s_not_ready[sensor] : 0,
+                    .transfer_bytes=dev->data_read_size, .sync=mavlink_clock_status(),
+                };
+                memcpy(record.distance_mm, results.distance_mm, TOF_NATIVE_PIXELS*sizeof(int16_t));
+                memcpy(record.target_status, results.target_status, TOF_NATIVE_PIXELS);
+                if (xQueueSend(s_records,&record,0)!=pdTRUE) {
+                    xSemaphoreTake(s_scan_mutex,portMAX_DELAY); ++s_record_drops; xSemaphoreGive(s_scan_mutex);
+                }
+                s_not_ready[sensor]=0;
                 consecutive_fails = 0;
                 bool first_frame = false;
                 bool ring_frame_ready = false;
@@ -766,10 +819,10 @@ void tof_task(void *arg)
                 s_last_frame_ms[sensor] = now_ms;
                 memcpy(s_scan.frame[sensor].distance_mm,
                        results.distance_mm,
-                       TOF_PIXELS_PER_SENSOR * sizeof(int16_t));
+                       TOF_NATIVE_PIXELS * sizeof(int16_t));
                 memcpy(s_scan.frame[sensor].target_status,
                        results.target_status,
-                       TOF_PIXELS_PER_SENSOR * sizeof(uint8_t));
+                       TOF_NATIVE_PIXELS * sizeof(uint8_t));
                 s_scan.frame[sensor].timestamp_ms = now_ms;
                 s_scan.frame[sensor].valid        = 1;
                 s_sensor_ok[sensor] = 1U;
@@ -800,13 +853,13 @@ void tof_task(void *arg)
                 }
             }
         } else {
+            s_not_ready[sensor] = ready_before_us;
             // The bus transaction succeeded; the per-sensor stale deadline
             // above handles a device that never becomes data-ready.
             consecutive_fails = 0;
         }
 
-        // A short inter-channel yield keeps the task cooperative while the
-        // complete ring is scanned much faster than the ranging period.
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // Yield once per full ring, avoiding an artificial millisecond per sensor.
+        if (sensor == TOF_SENSOR_COUNT-1) vTaskDelay(pdMS_TO_TICKS(1));
     }
 }

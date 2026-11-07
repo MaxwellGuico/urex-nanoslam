@@ -1,4 +1,5 @@
 #include "mavlink_task.h"
+#include "experiment_task.h"
 
 // MAVLink — header-only, common dialect covers everything PX4 needs.
 // Do NOT define MAVLINK_USE_CONVENIENCE_FUNCTIONS — that path requires a
@@ -17,14 +18,45 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#ifndef CONFIG_EXPERIMENT_MISSION_ENABLED
+#define CONFIG_EXPERIMENT_MISSION_ENABLED 0
+#endif
+#ifndef CONFIG_NANOLITE_BENCH_MODE
+#define CONFIG_NANOLITE_BENCH_MODE 0
+#endif
 
 static const char *TAG = "mav";
 
 // ---------------------------------------------------------------------------
 // UART config
 // ---------------------------------------------------------------------------
-#define UART_TX_BUF     512     // outbound ring buffer
-#define UART_RX_BUF     1024    // inbound ring buffer (headroom for bursts)
+#define UART_TX_BUF     1024    // outbound ring buffer
+#define UART_RX_BUF     4096    // inbound ring buffer (headroom for QGC bursts)
+
+// ---------------------------------------------------------------------------
+// MAVLink UDP bridge for QGroundControl
+// ---------------------------------------------------------------------------
+// The ESP32 is the only reader of the PX4 UART, so it also owns the bridge:
+// raw bytes read from PX4 are forwarded to QGC, and raw UDP packets from QGC
+// are written back to PX4.
+//   CONFIG_MAVROS_BRIDGE_IN_PORT   = ESP32 UDP listen/source port (QGC target port)
+//   CONFIG_MAVROS_BRIDGE_OUT_PORT  = QGC UDP listen port
+//   CONFIG_HOST_IPV4_ADDR          = laptop/QGC IPv4 address
+#define MAV_BRIDGE_RX_BUF      1024
+#define MAV_BRIDGE_MAX_DRAIN   8       // bound UDP packets handled per loop
+
+static int s_bridge_sock = -1;
+static struct sockaddr_in s_qgc_addr;
+static uint32_t s_bridge_px4_to_qgc_bytes;
+static uint32_t s_bridge_qgc_to_px4_bytes;
+static uint32_t s_bridge_last_log_ms;
 
 // Pose telemetry required by NanoSLAM-Lite. PX4 may not publish these messages
 // continuously on every MAVLink port configuration, so request them explicitly
@@ -95,6 +127,8 @@ static uint32_t      s_sp_update_ms;   // timestamp of last setpoint update
 static SemaphoreHandle_t s_sp_mutex;
 static SemaphoreHandle_t s_state_mutex;
 
+static clock_sync_filter_t s_clock;
+static int64_t s_timesync_sent_us;
 static uint32_t s_pos_rx_count;
 static uint32_t s_att_rx_count;
 static uint32_t s_hb_rx_count;
@@ -102,6 +136,85 @@ static uint32_t s_hb_rx_count;
 // If no task updates the setpoint for this long, auto-switch to position hold.
 // Protects against nav_task crash leaving a stale velocity command.
 #define SP_STALE_TIMEOUT_MS  300
+
+// ---------------------------------------------------------------------------
+// MAVLink UDP bridge helpers
+// ---------------------------------------------------------------------------
+
+static void mavlink_bridge_init(void)
+{
+    s_bridge_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_bridge_sock < 0) {
+        ESP_LOGE(TAG, "QGC bridge socket create failed: errno=%d", errno);
+        return;
+    }
+
+    struct sockaddr_in bind_addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(CONFIG_MAVROS_BRIDGE_IN_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(s_bridge_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        ESP_LOGE(TAG, "QGC bridge bind failed on UDP %d: errno=%d",
+                 CONFIG_MAVROS_BRIDGE_IN_PORT, errno);
+        close(s_bridge_sock);
+        s_bridge_sock = -1;
+        return;
+    }
+
+    int flags = fcntl(s_bridge_sock, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(s_bridge_sock, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    memset(&s_qgc_addr, 0, sizeof(s_qgc_addr));
+    s_qgc_addr.sin_family = AF_INET;
+    s_qgc_addr.sin_port   = htons(CONFIG_MAVROS_BRIDGE_OUT_PORT);
+    if (inet_aton(CONFIG_HOST_IPV4_ADDR, &s_qgc_addr.sin_addr) == 0) {
+        ESP_LOGE(TAG, "Invalid QGC host IPv4 address: %s", CONFIG_HOST_IPV4_ADDR);
+        close(s_bridge_sock);
+        s_bridge_sock = -1;
+        return;
+    }
+
+    ESP_LOGI(TAG, "QGC MAVLink bridge enabled: PX4 UART <-> UDP %s:%d, local UDP %d",
+             CONFIG_HOST_IPV4_ADDR, CONFIG_MAVROS_BRIDGE_OUT_PORT,
+             CONFIG_MAVROS_BRIDGE_IN_PORT);
+}
+
+static inline void bridge_forward_px4_to_qgc(const uint8_t *buf, int len)
+{
+    if (s_bridge_sock < 0 || len <= 0) return;
+    int sent = sendto(s_bridge_sock, buf, len, MSG_DONTWAIT,
+                      (const struct sockaddr *)&s_qgc_addr, sizeof(s_qgc_addr));
+    if (sent > 0) s_bridge_px4_to_qgc_bytes += (uint32_t)sent;
+}
+
+static void bridge_poll_qgc_to_px4(void)
+{
+    if (s_bridge_sock < 0) return;
+    static uint8_t buf[MAV_BRIDGE_RX_BUF];   // static: keep it off the task stack
+
+    // Bounded drain so the setpoint stream is never starved by QGC bursts
+    // (e.g. a full parameter download).
+    for (int i = 0; i < MAV_BRIDGE_MAX_DRAIN; i++) {
+        int len = recvfrom(s_bridge_sock, buf, sizeof(buf), 0, NULL, NULL);
+        if (len <= 0) break;
+        int written = uart_write_bytes(MAV_UART_PORT, (const char *)buf, len);
+        if (written > 0) s_bridge_qgc_to_px4_bytes += (uint32_t)written;
+    }
+}
+
+static void bridge_periodic_log(uint32_t now_ms)
+{
+    if (s_bridge_sock < 0) return;
+    if ((uint32_t)(now_ms - s_bridge_last_log_ms) >= 5000U) {
+        ESP_LOGI(TAG, "QGC bridge traffic: PX4->QGC=%lu bytes, QGC->PX4=%lu bytes",
+                 (unsigned long)s_bridge_px4_to_qgc_bytes,
+                 (unsigned long)s_bridge_qgc_to_px4_bytes);
+        s_bridge_last_log_ms = now_ms;
+    }
+}
 
 
 // ---------------------------------------------------------------------------
@@ -165,6 +278,8 @@ static void request_pose_streams(void)
     request_message_interval(MAVLINK_MSG_ID_LOCAL_POSITION_NED,
                              POSE_STREAM_INTERVAL_US);
     request_message_interval(MAVLINK_MSG_ID_ATTITUDE,
+                             POSE_STREAM_INTERVAL_US);
+    request_message_interval(MAVLINK_MSG_ID_ATTITUDE_QUATERNION,
                              POSE_STREAM_INTERVAL_US);
     ESP_LOGI(TAG, "Requested PX4 position + attitude at %d Hz",
              CONFIG_NANOLITE_POSE_RATE_HZ);
@@ -337,23 +452,63 @@ static void parse_incoming(void)
 {
     uint8_t byte;
     mavlink_message_t msg;
-    mavlink_status_t  status;
+    static mavlink_status_t status;
 
-    // Read all available bytes without blocking
-    int available = 0;
-    uart_get_buffered_data_len(MAV_UART_PORT, (size_t *)&available);
+    // Read the available bytes in chunks without blocking. Each chunk is
+    // forwarded raw to QGC, then parsed byte-by-byte for local state.
+    uint8_t rx_buf[256];
+    int rx_len = 0, rx_pos = 0;
+    size_t remaining = 0;
+    uart_get_buffered_data_len(MAV_UART_PORT, &remaining);
 
-    for (int i = 0; i < available; i++) {
-        if (uart_read_bytes(MAV_UART_PORT, &byte, 1, 0) != 1) break;
+    while (rx_pos < rx_len || remaining > 0) {
+        if (rx_pos >= rx_len) {
+            size_t want = remaining > sizeof(rx_buf) ? sizeof(rx_buf) : remaining;
+            int n = uart_read_bytes(MAV_UART_PORT, rx_buf, want, 0);
+            if (n <= 0) break;
+            bridge_forward_px4_to_qgc(rx_buf, n);
+            remaining -= (size_t)n;
+            rx_len = n;
+            rx_pos = 0;
+        }
+        byte = rx_buf[rx_pos++];
 
         if (!mavlink_parse_char(MAVLINK_COMM_0, byte, &msg, &status)) continue;
 
         // Only process messages from PX4 (sysid=1, compid=1)
-        if (msg.sysid != PX4_SYSID) continue;
+        if (msg.sysid != PX4_SYSID || msg.compid != PX4_COMPID) continue;
 
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
         switch (msg.msgid) {
+
+        case MAVLINK_MSG_ID_TIMESYNC: {
+            mavlink_timesync_t ts;
+            mavlink_msg_timesync_decode(&msg, &ts);
+            int64_t rx_us = esp_timer_get_time();
+            /* Replies are matched on our exact outstanding nonce only. Some PX4
+             * builds leave target_system/target_component uninitialised in
+             * TIMESYNC replies (observed 148/108 on this vehicle), so the target
+             * fields cannot be trusted for replies. */
+            if (ts.tc1 > 0) {
+                if (s_timesync_sent_us <= 0 || ts.ts1 != s_timesync_sent_us * 1000) break;
+                xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                clock_sync_observe(&s_clock, s_timesync_sent_us, rx_us, ts.tc1 / 1000);
+                xSemaphoreGive(s_state_mutex);
+                s_timesync_sent_us = 0;
+                break;
+            }
+            /* Request from PX4 (tc1 == 0): answer it if addressed to us or broadcast. */
+            if ((ts.target_system && ts.target_system != OBC_SYSID) ||
+                (ts.target_component && ts.target_component != OBC_COMPID)) break;
+            if (ts.tc1 == 0) {
+                mavlink_message_t reply;
+                mavlink_msg_timesync_pack(OBC_SYSID, OBC_COMPID, &reply,
+                                         rx_us * 1000, ts.ts1, msg.sysid, msg.compid);
+                send_message(&reply);
+            }
+            break;
+        }
 
         case MAVLINK_MSG_ID_LOCAL_POSITION_NED: {
             mavlink_local_position_ned_t pos;
@@ -363,6 +518,7 @@ static void parse_incoming(void)
             s_state.x  = pos.x;   s_state.y  = pos.y;   s_state.z  = pos.z;
             s_state.vx = pos.vx;  s_state.vy = pos.vy;  s_state.vz = pos.vz;
             s_state.enu_z     = -pos.z;   // NED z-down → ENU z-up
+            s_state.pos_boot_ms = pos.time_boot_ms;
             s_state.last_pos_ms = now_ms;
             xSemaphoreGive(s_state_mutex);
             ++s_pos_rx_count;
@@ -379,9 +535,44 @@ static void parse_incoming(void)
 
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
             s_state.heading     = heading;
+            s_state.roll        = att.roll;
+            s_state.pitch       = att.pitch;
+            // Use ATTITUDE for rates/quaternion only while no ATTITUDE_QUATERNION
+            // has arrived in the last 500 ms.
+            if (s_state.last_q_ms == 0 || now_ms - s_state.last_q_ms > 500) {
+                s_state.rollspeed  = att.rollspeed;
+                s_state.pitchspeed = att.pitchspeed;
+                s_state.yawspeed   = att.yawspeed;
+                float cr = cosf(att.roll * 0.5f),  sr = sinf(att.roll * 0.5f);
+                float cp = cosf(att.pitch * 0.5f), sp = sinf(att.pitch * 0.5f);
+                float cy = cosf(att.yaw * 0.5f),   sy = sinf(att.yaw * 0.5f);
+                s_state.q[0] = cr * cp * cy + sr * sp * sy;
+                s_state.q[1] = sr * cp * cy - cr * sp * sy;
+                s_state.q[2] = cr * sp * cy + sr * cp * sy;
+                s_state.q[3] = cr * cp * sy - sr * sp * cy;
+                s_state.q_from_px4  = 0;
+                s_state.att_boot_ms = att.time_boot_ms;
+            }
             s_state.last_att_ms = now_ms;
             xSemaphoreGive(s_state_mutex);
             ++s_att_rx_count;
+            break;
+        }
+
+        case MAVLINK_MSG_ID_ATTITUDE_QUATERNION: {
+            mavlink_attitude_quaternion_t aq;
+            mavlink_msg_attitude_quaternion_decode(&msg, &aq);
+
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            s_state.q[0] = aq.q1;  s_state.q[1] = aq.q2;
+            s_state.q[2] = aq.q3;  s_state.q[3] = aq.q4;
+            s_state.rollspeed   = aq.rollspeed;
+            s_state.pitchspeed  = aq.pitchspeed;
+            s_state.yawspeed    = aq.yawspeed;
+            s_state.q_from_px4  = 1;
+            s_state.att_boot_ms = aq.time_boot_ms;
+            s_state.last_q_ms   = now_ms;
+            xSemaphoreGive(s_state_mutex);
             break;
         }
 
@@ -430,6 +621,8 @@ void mavlink_task_init(void)
     // Zero state
     memset(&s_sp,    0, sizeof(s_sp));
     memset(&s_state, 0, sizeof(s_state));
+    clock_sync_reset(&s_clock);
+    s_timesync_sent_us=0;
     s_pos_rx_count = 0;
     s_att_rx_count = 0;
     s_hb_rx_count = 0;
@@ -512,6 +705,14 @@ void mavlink_send_land_command(void)
     send_land();
 }
 
+clock_sync_status_t mavlink_clock_status(void)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    clock_sync_status_t copy = clock_sync_status(&s_clock, esp_timer_get_time());
+    xSemaphoreGive(s_state_mutex);
+    return copy;
+}
+
 drone_state_t mavlink_get_state(void)
 {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
@@ -568,11 +769,17 @@ void mavlink_task(void *arg)
     ESP_LOGI(TAG, "UART%d ready: TX=GPIO%d RX=GPIO%d @ %d baud",
              MAV_UART_PORT, MAV_TX_PIN, MAV_RX_PIN, MAV_BAUD_RATE);
 
+    // wifi_task_init() has already run esp_netif_init(), so the socket can be
+    // opened before the link is up; sends just fail until WiFi connects.
+    // A failure here only disables QGC bridging, not PX4 control.
+    mavlink_bridge_init();
+
     request_pose_streams();
 
     // ---- Timing state ----
     TickType_t last_wake_tick = xTaskGetTickCount();
     uint32_t   last_hb_ms     = 0;
+    uint32_t last_sp_ms = 0, last_sync_ms = 0;
     uint32_t   last_stream_request_ms =
         (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t   last_rx_report_ms = last_stream_request_ms;
@@ -590,11 +797,27 @@ void mavlink_task(void *arg)
             last_hb_ms = now_ms;
         }
 
-        // 20 Hz: setpoint (MUST NOT be skipped — PX4 watchdog is 500ms)
-        send_setpoint();
+        // Drain UART every millisecond; keep flight setpoints at 20 Hz.
+        // Manual/bench images never publish flight-control setpoints.
+        if (!CONFIG_NANOLITE_BENCH_MODE &&
+            (!CONFIG_EXPERIMENT_MISSION_ENABLED || experiment_controls_enabled()) &&
+            now_ms - last_sp_ms >= 50) {
+            send_setpoint();
+            last_sp_ms = now_ms;
+        }
+        if (now_ms - last_sync_ms >= 100) {
+            mavlink_message_t sync;
+            s_timesync_sent_us = esp_timer_get_time();
+            mavlink_msg_timesync_pack(OBC_SYSID, OBC_COMPID, &sync,
+                                     0, s_timesync_sent_us * 1000, PX4_SYSID, PX4_COMPID);
+            send_message(&sync);
+            last_sync_ms = now_ms;
+        }
 
-        // Drain RX buffer and update s_state
+        // QGC -> PX4, then PX4 -> (QGC + s_state)
+        bridge_poll_qgc_to_px4();
         parse_incoming();
+        bridge_periodic_log(now_ms);
 
         // Incoming timestamps are captured inside parse_incoming(). Resample
         // after parsing so a message received across a millisecond boundary
@@ -630,7 +853,6 @@ void mavlink_task(void *arg)
             last_rx_report_ms = now_ms;
         }
 
-        // Precise 50ms period using vTaskDelayUntil to absorb execution time
-        vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(50));
+        vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(1));
     }
 }

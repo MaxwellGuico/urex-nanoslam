@@ -27,11 +27,36 @@ menu "Drone Configuration"
         help 
             Wifi hotspot password.
 
+    config WIFI_STATIC_IP
+        bool "Use a static IPv4 address for the drone"
+        default n
+        help
+            Disable DHCP and use the drone address, gateway, and subnet mask
+            below. Choose an unused address on the access point's subnet and
+            reserve it or exclude it from the access point's DHCP pool.
+            This does not change the laptop telemetry destination.
+
+    config DRONE_STATIC_IPV4_ADDR
+        string "Drone static IPv4 address"
+        depends on WIFI_STATIC_IP
+        default "192.0.2.2"
+
+    config WIFI_STATIC_GATEWAY
+        string "Static IPv4 gateway"
+        depends on WIFI_STATIC_IP
+        default "192.0.2.1"
+
+    config WIFI_STATIC_NETMASK
+        string "Static IPv4 subnet mask"
+        depends on WIFI_STATIC_IP
+        default "255.255.255.0"
+
     config HOST_IPV4_ADDR
-        string "IPV4 Address"
+        string "Laptop telemetry destination IPv4 address"
         default "192.0.2.1"
         help
-            IPV4 address to which the client example will send data.
+            IPv4 address of the laptop that receives telemetry. This is
+            separate from the drone's own static or DHCP-assigned address.
 
     config TOF_BRIDGE_PORT
         int "TOF bridge port (outgoing)"
@@ -85,6 +110,59 @@ menu "Drone Configuration"
         help
           UDP port on the laptop that receives telemetry packets.
 
+    config EXPERIMENT_MISSION_ENABLED
+        bool "Use staged rectangle experiment mission instead of exploration"
+        default n
+        help
+          In flight builds, use the onboard takeoff/rectangle/land state machine.
+          The laptop must explicitly submit an experiment command. Bench builds
+          always remain passive. No navigation task runs in this mode.
+
+    config NANOLITE_ENABLED
+        bool "Run NanoSLAM-Lite task"
+        default y
+
+    config EXPERIMENT_WITHOUT_TOF
+        bool "Disable ToF acquisition and obstacle checks for baseline flights"
+        depends on EXPERIMENT_MISSION_ENABLED && !NANOLITE_ENABLED && !NANOLITE_BENCH_MODE
+        default n
+        help
+          Only for staged takeoff/land and rectangle flight baselines. Do not
+          initialize or start the ToF acquisition task. Experiment arming and
+          flight health checks then require PX4 telemetry and clock sync only;
+          there is no ToF obstacle protection. Telemetry reports grid/rate 0/0.
+
+    config EXPERIMENT_OBSTACLE_ABORT
+        bool "Abort experiment rectangles when ToF sees an obstacle within 0.4 m"
+        depends on EXPERIMENT_MISSION_ENABLED && !EXPERIMENT_WITHOUT_TOF
+        default n
+        help
+          Off by default for recording runs flown over a verified-clear area:
+          single noisy ToF zones caused false aborts. ToF freshness, PX4
+          telemetry and clock-sync health checks still abort when off.
+
+    config TOF_GRID_SIZE
+        int "Native ToF grid width (4 or 8)"
+        range 4 8
+        default 8
+
+    config TOF_RATE_HZ
+        int "Native ToF rate (Hz)"
+        range 1 60
+        default 15
+
+    config DATA_TELEM_HZ
+        int "Laptop PX4 telemetry snapshot rate (Hz)"
+        range 10 100
+        default 50
+
+    config TOF_LEGACY_DEBUG
+        bool "Also send legacy 8x8 heatmap snapshots at 10 Hz"
+        default y
+        help
+          Only emitted for 8x8 profiles. Native recording packets are queued
+          separately and include timing, clock synchronization and loss counters.
+
     config TOF_FRONT_SENSOR_IDX
         int "Front-facing ToF sensor index (0-7)"
         range 0 7
@@ -125,7 +203,7 @@ menu "Drone Configuration"
 
     config NANOLITE_POSE_RATE_HZ
         int "NanoSLAM-Lite pose observation rate (Hz)"
-        range 5 50
+        range 5 100
         default 20
         help
           Rate at which the read-only NanoSLAM-Lite task samples the fused PX4

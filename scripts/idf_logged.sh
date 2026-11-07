@@ -5,33 +5,22 @@ set -uo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  ./scripts/idf_logged.sh [--power external|no-external] <idf.py arguments...>
+  ./scripts/idf_logged.sh <idf.py arguments...>
 
 Examples:
   ./scripts/idf_logged.sh build
-  ./scripts/idf_logged.sh --power external -p /dev/ttyACM0 flash monitor
-  ./scripts/idf_logged.sh --power no-external -p /dev/ttyACM0 monitor
+  ./scripts/idf_logged.sh -p /dev/ttyACM0 flash monitor
+  ./scripts/idf_logged.sh -p /dev/ttyACM0 monitor
 
-Build logs are saved under run-logs/builds/. Monitor logs are grouped by
-their declared ToF power condition. A sibling .evidence directory records the
+Build logs are saved under run-logs/builds/ and monitor logs under
+run-logs/hardware/. A sibling .evidence directory records the
 exact Git state, tracked patch, untracked files, configuration, and artifact
 hashes. Press Ctrl+] to leave the IDF monitor.
 EOF
 }
 
-power_condition="unspecified"
-
 while (($# > 0)); do
     case "$1" in
-        --power)
-            if (($# < 2)); then
-                echo "error: --power requires external or no-external" >&2
-                usage >&2
-                exit 2
-            fi
-            power_condition="$2"
-            shift 2
-            ;;
         -h|--help)
             usage
             exit 0
@@ -45,14 +34,6 @@ while (($# > 0)); do
             ;;
     esac
 done
-
-case "$power_condition" in
-    external|no-external|unspecified) ;;
-    *)
-        echo "error: --power must be external or no-external" >&2
-        exit 2
-        ;;
-esac
 
 if (($# == 0)); then
     usage >&2
@@ -80,11 +61,7 @@ for argument in "$@"; do
 done
 
 if [[ "$has_monitor" == true ]]; then
-    case "$power_condition" in
-        external) log_subdir="with-external-tof-power" ;;
-        no-external) log_subdir="without-external-tof-power" ;;
-        unspecified) log_subdir="power-unspecified" ;;
-    esac
+    log_subdir="hardware"
     if [[ "$has_flash" == true ]]; then
         operation="flash-monitor"
     else
@@ -105,6 +82,23 @@ mkdir -p -- "$log_dir"
 mkdir -p -- "$evidence_dir"
 chmod 700 "$evidence_dir"
 
+# Resolve the selected build/config paths for isolated experiment evidence.
+artifact_dir="$project_dir/build"
+active_config="$project_dir/sdkconfig"
+previous_argument=""
+for argument in "$@"; do
+    if [[ "$previous_argument" == "-B" || "$previous_argument" == "--build-dir" ]]; then
+        artifact_dir="$argument"
+    elif [[ "$argument" == --build-dir=* ]]; then
+        artifact_dir="${argument#*=}"
+    elif [[ "$argument" == SDKCONFIG=* || "$argument" == -DSDKCONFIG=* ]]; then
+        active_config="${argument#*=}"
+    fi
+    previous_argument="$argument"
+done
+[[ "$artifact_dir" == /* ]] || artifact_dir="$project_dir/$artifact_dir"
+[[ "$active_config" == /* ]] || active_config="$project_dir/$active_config"
+
 git_revision="$(git -C "$project_dir" rev-parse --short HEAD 2>/dev/null || printf 'unavailable')"
 git_revision_full="$(git -C "$project_dir" rev-parse HEAD 2>/dev/null || printf 'unavailable')"
 git_state="clean"
@@ -123,7 +117,10 @@ if ((${#untracked_files[@]} > 0)); then
         -- "${untracked_files[@]}"
 fi
 
-for config_file in sdkconfig sdkconfig.defaults dependencies.lock partitions.csv; do
+if [[ -f "$active_config" ]]; then
+    install -m 600 "$active_config" "$evidence_dir/sdkconfig"
+fi
+for config_file in sdkconfig.defaults dependencies.lock partitions.csv; do
     if [[ -f "$project_dir/$config_file" ]]; then
         install -m 600 "$project_dir/$config_file" \
             "$evidence_dir/$config_file"
@@ -135,7 +132,6 @@ done
     printf 'Captured: %s\n' "$(date --iso-8601=seconds)"
     printf 'Git revision: %s\n' "$git_revision_full"
     printf 'Git state: %s\n' "$git_state"
-    printf 'ToF power: %s\n' "$power_condition"
     printf 'Working directory: %s\n' "$project_dir"
     printf 'ESP-IDF: '
     idf.py --version 2>&1
@@ -160,7 +156,6 @@ done
     printf 'UREX ESP-IDF terminal log\n'
     printf 'Started: %s\n' "$(date --iso-8601=seconds)"
     printf 'Git revision: %s (%s)\n' "$git_revision" "$git_state"
-    printf 'ToF power: %s\n' "$power_condition"
     printf 'Evidence: %s\n' "$evidence_dir"
     printf 'Working directory: %s\n' "$project_dir"
     printf 'Command:'
@@ -178,12 +173,12 @@ fi
 artifact_hash_file="$evidence_dir/build-artifacts.sha256"
 : >"$artifact_hash_file"
 for artifact in \
-    build/esp-everything.elf \
-    build/esp-everything.bin \
-    build/bootloader/bootloader.bin \
-    build/partition_table/partition-table.bin; do
-    if [[ -f "$project_dir/$artifact" ]]; then
-        sha256sum "$project_dir/$artifact" >>"$artifact_hash_file"
+    esp-everything.elf \
+    esp-everything.bin \
+    bootloader/bootloader.bin \
+    partition_table/partition-table.bin; do
+    if [[ -f "$artifact_dir/$artifact" ]]; then
+        sha256sum "$artifact_dir/$artifact" >>"$artifact_hash_file"
     fi
 done
 

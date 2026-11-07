@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-tof_debug.py — Print ToF debug packets from the front sensor.
+tof_debug.py — Print ToF debug packets from the sensor ring.
 
-The ESP32 sends WIFI_PKT_TOF_DEBUG (0x03) packets to UDP port 5007 at 10 Hz.
+The ESP32 sends WIFI_PKT_TOF_DEBUG (0x03) packets to UDP port 5007 at 10 Hz
+per sensor. Older firmware sends only the front sensor.
 Run while the drone is powered; flight is not required.
 
     python3 tof_debug.py [--port 5007] [--front-idx 1] [--full-grid]
@@ -104,7 +105,7 @@ def print_collapsed(front_sensor_idx, sensor_idx, distances, statuses):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Print raw front ToF sensor data")
+    ap = argparse.ArgumentParser(description="Print raw ToF ring sensor data")
     ap.add_argument("--port",     type=int, default=LISTEN_PORT)
     ap.add_argument("--front-idx", type=int, default=TOF_FRONT_SENSOR_IDX,
                     help="Front sensor index (CONFIG_TOF_FRONT_SENSOR_IDX, default: 1)")
@@ -117,7 +118,7 @@ def main():
     print(f"Listening for ToF debug on UDP :{args.port}  (Ctrl-C to stop)")
     print(f"Expecting packet size: {_SIZE} bytes\n")
 
-    prev_ts = None
+    prev_ts = {}
     while True:
         data, addr = sock.recvfrom(512)
         if len(data) < _SIZE or data[0] != PKT_TOF_DEBUG:
@@ -131,8 +132,8 @@ def main():
         distances  = fields[4 : 4 + PIXELS]
         statuses   = fields[4 + PIXELS :]
 
-        dt_ms = (ts_ms - prev_ts) if prev_ts is not None else 0
-        prev_ts = ts_ms
+        dt_ms = (ts_ms - prev_ts[sensor_idx]) & 0xFFFFFFFF if sensor_idx in prev_ts else 0
+        prev_ts[sensor_idx] = ts_ms
 
         valid_count = sum(1 for s in statuses if s in VALID_STATUS)
 

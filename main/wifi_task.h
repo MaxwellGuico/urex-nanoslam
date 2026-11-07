@@ -13,7 +13,8 @@
 /* Packet type bytes */
 #define WIFI_PKT_TELEM       0x01
 #define WIFI_PKT_CMD         0x02
-#define WIFI_PKT_TOF_DEBUG   0x03   /* debug: raw front-sensor 8×8 frame */
+#define WIFI_PKT_TOF_RECORD  0x05
+#define WIFI_PKT_TOF_DEBUG   0x03   /* debug: one raw ring-sensor 8×8 frame */
 
 /* Separate UDP port for ToF debug stream so it doesn't conflict with comms.py */
 #define WIFI_TOF_DEBUG_PORT  5007
@@ -45,7 +46,52 @@ typedef struct __attribute__((packed)) {
     uint8_t  is_stuck;                      /* 1 = STUCK or RETREATING          */
 
     uint16_t reloc_age_s;                   /* seconds since last nav-tag fix   */
+
+    /* Appended extension. Keep legacy fields above in their original order. */
+    uint16_t px4_hb_age_ms;
+    uint16_t px4_pos_age_ms;
+    uint16_t px4_att_age_ms;
+    uint8_t  px4_link_ok;
+    uint8_t  px4_armed;
+    uint8_t  px4_custom_main_mode;
+
+    float    ned_z;                         /* NED down (m), odom frame          */
+    float    ned_vx;                        /* NED north velocity (m/s)          */
+    float    ned_vy;                        /* NED east velocity (m/s)           */
+    float    ned_vz;                        /* NED down velocity (m/s)            */
+
+    /* Appended extension 2: full PX4 attitude for logging (raw PX4 values). */
+    float    q_w, q_x, q_y, q_z;            /* attitude quaternion (body FRD -> NED) */
+    float    roll_rate, pitch_rate, yaw_rate; /* body rates (rad/s)               */
+    float    roll_rad, pitch_rad;           /* from ATTITUDE                      */
+    uint32_t px4_pos_boot_ms;               /* PX4 time_boot_ms of position sample */
+    uint32_t px4_att_boot_ms;               /* PX4 time_boot_ms of attitude sample */
+    uint8_t  q_from_px4;                    /* 1 = ATTITUDE_QUATERNION, 0 = from euler */
+    /* Versioned, additive experiment timing extension; total 165 bytes. */
+    uint64_t esp_send_us;
+    int64_t clock_offset_us;
+    uint32_t sync_rtt_us, sync_age_us;
+    uint16_t sync_samples;
+    uint8_t sync_locked, experiment_phase;
+    uint32_t mission_id;
+    uint8_t corner, tof_side, tof_hz, passive;
+    uint32_t boot_id;
 } wifi_telem_pkt_t;
+
+/* 88-byte native frame header, then side*side int16 distances and uint8 statuses.
+ * Readiness and readout boundaries are logged, not optical exposure.
+ * flags bit0=sync locked, bit1=previous-not-ready bound valid,
+ * bit2=sensor frame counter changed between ready check and result readout. */
+typedef struct __attribute__((packed)) {
+    uint8_t pkt_type, version, drone_id, sensor, rows, cols, hz, flags;
+    uint32_t boot_id, sequence, queue_drops;
+    uint64_t ready_before_us, ready_after_us, read_start_us, read_end_us;
+    uint64_t previous_not_ready_us, send_us;
+    int64_t clock_offset_us;
+    uint32_t sync_rtt_us, sync_age_us;
+    uint16_t transfer_bytes;
+    uint8_t streamcount, sync_samples;
+} wifi_tof_record_header_t;
 
 /* ---------------------------------------------------------------------------
  * Command packet — received from laptop over UDP.
@@ -108,16 +154,18 @@ typedef struct {
 wifi_peer_list_t wifi_get_peers(void);
 
 /* ---------------------------------------------------------------------------
- * ToF debug packet — sent at 10 Hz to WIFI_TOF_DEBUG_PORT.
- * Contains the raw 8×8 distance + status grid for the front sensor only.
+ * ToF debug packet — each sensor sent at 10 Hz to WIFI_TOF_DEBUG_PORT.
+ * The original 199-byte prefix is preserved for existing laptop readers.
+ * The appended sender uptime lets viewers age an already-old source frame.
  * --------------------------------------------------------------------------- */
 typedef struct __attribute__((packed)) {
     uint8_t  pkt_type;                              /* WIFI_PKT_TOF_DEBUG           */
-    uint8_t  sensor_idx;                            /* TOF_FRONT_SENSOR_IDX         */
+    uint8_t  sensor_idx;                            /* ring / mux index 0..7        */
     uint8_t  sensor_ok;                             /* 1 if sensor initialised      */
     uint32_t timestamp_ms;                          /* frame timestamp from sensor  */
     uint16_t distance_mm[WIFI_TOF_DEBUG_PIXELS];    /* raw distances, 0 = invalid   */
     uint8_t  target_status[WIFI_TOF_DEBUG_PIXELS];  /* 5 = valid, 9 = valid-weak    */
+    uint32_t sent_ms;                               /* sender uptime at snapshot    */
 } wifi_tof_debug_pkt_t;
 
 /* ---------------------------------------------------------------------------

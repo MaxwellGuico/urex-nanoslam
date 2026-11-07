@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include "driver/i2c_master.h"
 #include "nanolite_tof.h"
+#include "clock_sync.h"
+#include "sdkconfig.h"
 
 // ---------------------------------------------------------------------------
 // Hardware config
@@ -14,7 +16,13 @@
 #define TOF_SDA_PIN             CONFIG_TCA_SDA_GPIO_PORT   // from menuconfig
 #define TOF_SCL_PIN             CONFIG_TCA_SCL_GPIO_PORT
 #define TCA_I2C_ADDR            0x70
-#define TOF_RANGING_FREQ_HZ     10
+#define TOF_RANGING_FREQ_HZ     CONFIG_TOF_RATE_HZ
+#define TOF_INTEGRATION_MS      5U
+#define TOF_NATIVE_SIDE         CONFIG_TOF_GRID_SIZE
+#define TOF_NATIVE_PIXELS       (TOF_NATIVE_SIDE * TOF_NATIVE_SIDE)
+#if (TOF_NATIVE_SIDE != 4 && TOF_NATIVE_SIDE != 8) || (TOF_NATIVE_SIDE == 8 && TOF_RANGING_FREQ_HZ > 15)
+#error "Supported ToF profiles: 8x8 up to 15 Hz, 4x4 up to 60 Hz"
+#endif
 #define TOF_MAX_VALID_MM        3000    // discard readings above this (sensor max is 4m)
 #define TOF_MIN_VALID_MM        50      // discard readings below this (sensor blind zone)
 #define TOF_NAV_MAX_FRAME_AGE_MS 250U   // maximum frame age accepted by flight safety
@@ -142,3 +150,19 @@ bool tof_sector_is_fresh(float angle_min_deg, float angle_max_deg,
 // Returns the number of sensors that have supplied a complete frame (0–8).
 // A successful configure/start command alone is deliberately insufficient.
 int tof_sensors_ok_count(void);
+
+/* Every acquired native frame. Timestamps bracket host observation/readout,
+ * not the optical integration interval, which the ULD does not timestamp. */
+typedef struct {
+    uint8_t sensor, streamcount;
+    bool changed_during_read;
+    uint32_t sequence;
+    uint64_t ready_before_us, ready_after_us, read_start_us, read_end_us;
+    uint64_t previous_not_ready_us;
+    uint16_t transfer_bytes;
+    clock_sync_status_t sync;
+    int16_t distance_mm[64];
+    uint8_t target_status[64];
+} tof_record_t;
+bool tof_pop_record(tof_record_t *record);
+uint32_t tof_record_drops(void);

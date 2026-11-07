@@ -4,6 +4,8 @@
 #include "at_detect.h"
 #include "odom.h"
 #include "tof_task.h"
+#include "experiment_task.h"
+#include "esp_random.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,6 +23,11 @@
 #include <fcntl.h>
 
 static const char *TAG = "wifi";
+static uint32_t s_boot_id;
+_Static_assert(sizeof(wifi_tof_record_header_t)==88, "Native record header changed");
+
+_Static_assert(sizeof(wifi_telem_pkt_t) == 165, "Telemetry wire layout changed");
+_Static_assert(sizeof(wifi_tof_debug_pkt_t) == 203, "ToF debug wire layout changed");
 
 /* Cruise altitude for CMD_GOTO — must match CRUISE_ALT_M in main.c */
 #define WIFI_CRUISE_ALT_M   0.5f
@@ -29,9 +36,63 @@ static volatile bool s_land_requested  = false;
 static volatile bool s_start_requested = false;
 static volatile bool s_wifi_connected  = false;
 
+static uint16_t telemetry_age_ms(uint32_t now_ms, uint32_t last_ms)
+{
+    if (last_ms == 0) return UINT16_MAX;
+    uint32_t age = now_ms - last_ms;
+    return age > UINT16_MAX ? UINT16_MAX : (uint16_t)age;
+}
+
 /* Peer drone positions (map frame), protected by s_peer_mutex */
 static wifi_peer_list_t   s_peers = { .count = 0 };
 static SemaphoreHandle_t  s_peer_mutex;
+
+static const char *wifi_disconnect_reason(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND: return "access point not found; check SSID and 2.4 GHz hotspot";
+    case WIFI_REASON_AUTH_FAIL: return "authentication failed; check password/security";
+    case WIFI_REASON_AUTH_EXPIRE: return "authentication expired";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT: return "security handshake timed out; check password/signal";
+    case WIFI_REASON_BEACON_TIMEOUT: return "access point beacons lost; check signal/hotspot";
+    case WIFI_REASON_ASSOC_FAIL: return "access point association failed";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY: return "no access point with compatible security";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD: return "access point security below threshold";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "access point signal below threshold";
+    default: return "see ESP-IDF Wi-Fi reason code";
+    }
+}
+
+static void wifi_connect(void)
+{
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Connection request failed: %s", esp_err_to_name(err));
+    }
+}
+
+#if CONFIG_WIFI_STATIC_IP
+static esp_err_t wifi_configure_static_ip(esp_netif_t *netif)
+{
+    esp_netif_ip_info_t ip = {0};
+    if (esp_netif_str_to_ip4(CONFIG_DRONE_STATIC_IPV4_ADDR, &ip.ip) != ESP_OK ||
+        esp_netif_str_to_ip4(CONFIG_WIFI_STATIC_GATEWAY, &ip.gw) != ESP_OK ||
+        esp_netif_str_to_ip4(CONFIG_WIFI_STATIC_NETMASK, &ip.netmask) != ESP_OK) {
+        ESP_LOGE(TAG, "Invalid static IPv4 address, gateway, or subnet mask in sdkconfig");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = esp_netif_dhcpc_stop(netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        return err;
+    }
+    ESP_LOGI(TAG, "Static IPv4: %s, gateway: %s, mask: %s",
+             CONFIG_DRONE_STATIC_IPV4_ADDR, CONFIG_WIFI_STATIC_GATEWAY,
+             CONFIG_WIFI_STATIC_NETMASK);
+    return esp_netif_set_ip_info(netif, &ip);
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * WiFi event handler — auto-reconnect on disconnect
@@ -39,14 +100,23 @@ static SemaphoreHandle_t  s_peer_mutex;
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t event_id, void *data)
 {
-    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        wifi_connect();
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "Associated with access point; waiting for IPv4 readiness");
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *e = data;
         s_wifi_connected = false;
-        ESP_LOGW(TAG, "Disconnected — reconnecting...");
-        esp_wifi_connect();
+        ESP_LOGW(TAG, "Disconnected: reason=%u (%s) — reconnecting...",
+                 (unsigned)e->reason, wifi_disconnect_reason(e->reason));
+        wifi_connect();
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
         s_wifi_connected = true;
+    } else if (base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        s_wifi_connected = false;
+        ESP_LOGW(TAG, "IPv4 address lost");
     }
 }
 
@@ -55,16 +125,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
  *
  * Sensor, camera, MAVLink, and SLAM startup must not depend on the availability
  * of the ground-station access point. The event handler keeps retrying in the
- * background and s_wifi_connected becomes true after DHCP succeeds.
+ * background and s_wifi_connected becomes true once IPv4 is ready (static or DHCP).
  * --------------------------------------------------------------------------- */
 void wifi_task_init(void)
 {
+    s_boot_id=esp_random();
     s_peer_mutex  = xSemaphoreCreateMutex();
     configASSERT(s_peer_mutex != NULL);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    configASSERT(sta_netif != NULL);
+#if CONFIG_WIFI_STATIC_IP
+    ESP_ERROR_CHECK(wifi_configure_static_ip(sta_netif));
+#endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -72,7 +147,7 @@ void wifi_task_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+        IP_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
 
     wifi_config_t wifi_cfg = {};
     strncpy((char *)wifi_cfg.sta.ssid,     CONFIG_WIFI_SSID,     sizeof(wifi_cfg.sta.ssid));
@@ -81,7 +156,6 @@ void wifi_task_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_connect();
 
     ESP_LOGI(TAG, "Connecting to '%s'...", CONFIG_WIFI_SSID);
 }
@@ -94,6 +168,10 @@ void wifi_task_init(void)
  * --------------------------------------------------------------------------- */
 static void handle_command(const wifi_cmd_pkt_t *cmd)
 {
+#if CONFIG_EXPERIMENT_MISSION_ENABLED
+    if (cmd->cmd_type==CMD_LAND || cmd->cmd_type==CMD_HOLD) s_land_requested=true;
+    return; // Experiment commands exclusively own flight control in this image.
+#endif
     /* Always update the fleet's known-tag list */
     at_detect_set_known_tags(cmd->found_tag_ids, WIFI_MAX_FOUND_TAGS);
 
@@ -200,6 +278,32 @@ wifi_peer_list_t wifi_get_peers(void)
     return copy;
 }
 
+static void send_tof_records(int sock)
+{
+    tof_record_t record;
+    for (int count=0; count<16 && tof_pop_record(&record); ++count) {
+        wifi_tof_record_header_t h={
+            .pkt_type=WIFI_PKT_TOF_RECORD, .version=1, .drone_id=CONFIG_DRONE_ID,
+            .sensor=record.sensor, .rows=TOF_NATIVE_SIDE, .cols=TOF_NATIVE_SIDE,
+            .hz=TOF_RANGING_FREQ_HZ,
+            .flags=(record.sync.locked?1:0) | (record.previous_not_ready_us?2:0) | (record.changed_during_read?4:0),
+            .boot_id=s_boot_id, .sequence=record.sequence, .queue_drops=tof_record_drops(),
+            .ready_before_us=record.ready_before_us, .ready_after_us=record.ready_after_us,
+            .read_start_us=record.read_start_us, .read_end_us=record.read_end_us,
+            .previous_not_ready_us=record.previous_not_ready_us, .send_us=esp_timer_get_time(),
+            .clock_offset_us=record.sync.offset_us,
+            .sync_rtt_us=record.sync.rtt_us, .sync_age_us=record.sync.age_us,
+            .transfer_bytes=record.transfer_bytes, .streamcount=record.streamcount,
+            .sync_samples=record.sync.samples>255?255:record.sync.samples,
+        };
+        uint8_t buffer[sizeof(h)+TOF_NATIVE_PIXELS*3];
+        memcpy(buffer,&h,sizeof(h));
+        memcpy(buffer+sizeof(h),record.distance_mm,TOF_NATIVE_PIXELS*2);
+        memcpy(buffer+sizeof(h)+TOF_NATIVE_PIXELS*2,record.target_status,TOF_NATIVE_PIXELS);
+        send(sock,buffer,sizeof(buffer),MSG_DONTWAIT);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * wifi_task — 10 Hz telemetry loop + non-blocking command receive
  * --------------------------------------------------------------------------- */
@@ -245,6 +349,10 @@ void wifi_task(void *arg)
              CONFIG_HOST_IPV4_ADDR, CONFIG_TELEM_PORT, WIFI_CMD_PORT);
 
     TickType_t last_wake = xTaskGetTickCount();
+    int64_t last_telem_us=0;
+#if CONFIG_TOF_LEGACY_DEBUG && !CONFIG_EXPERIMENT_WITHOUT_TOF
+    int64_t last_debug_us=0;
+#endif
 
     while (1) {
         /* ---- Check for incoming commands (non-blocking) ---- */
@@ -252,7 +360,13 @@ void wifi_task(void *arg)
             uint8_t cmd_buf[256];
             int len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL);
             if (len >= 2 && cmd_buf[0] == WIFI_PKT_CMD) {
-                if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
+                if (cmd_buf[1] == CMD_EXPERIMENT && len==23) {
+                    experiment_request_t r={.mode=cmd_buf[2]};
+                    memcpy(&r.id,cmd_buf+3,4);
+                    memcpy(&r.width,cmd_buf+7,4); memcpy(&r.length,cmd_buf+11,4);
+                    memcpy(&r.altitude,cmd_buf+15,4); memcpy(&r.speed,cmd_buf+19,4);
+                    if (!experiment_submit(&r)) ESP_LOGW(TAG,"Experiment command rejected");
+                } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
                     handle_nav_tags(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_PEERS) {
                     handle_peers(cmd_buf, len);
@@ -262,6 +376,13 @@ void wifi_task(void *arg)
             }
         }
 
+        send_tof_records(tof_sock);
+        const int64_t tick_us=esp_timer_get_time();
+        if (tick_us-last_telem_us < 1000000/CONFIG_DATA_TELEM_HZ) {
+            vTaskDelayUntil(&last_wake,pdMS_TO_TICKS(1));
+            continue;
+        }
+        last_telem_us=tick_us;
         /* ---- Snapshot all shared state ---- */
         drone_state_t    drone = mavlink_get_state();
         nav_status_t     ns    = nav_get_status();
@@ -292,25 +413,73 @@ void wifi_task(void *arg)
 
         pkt.reloc_age_s = odom_reloc_age_s();
 
-        /* ---- Send telemetry ---- */
-        send(tx_sock, &pkt, sizeof(pkt), 0);
+        /* Appended PX4 health and kinematics for baseline logging. */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        pkt.px4_hb_age_ms  = telemetry_age_ms(now_ms, drone.last_hb_ms);
+        pkt.px4_pos_age_ms = telemetry_age_ms(now_ms, drone.last_pos_ms);
+        pkt.px4_att_age_ms = telemetry_age_ms(now_ms, drone.last_att_ms);
+        pkt.px4_link_ok = (pkt.px4_hb_age_ms < 2000
+                           && pkt.px4_pos_age_ms < 500
+                           && pkt.px4_att_age_ms < 500) ? 1 : 0;
+        pkt.px4_armed = drone.armed ? 1 : 0;
+        pkt.px4_custom_main_mode = drone.custom_main_mode;
+        pkt.ned_z  = drone.z;
+        pkt.ned_vx = drone.vx;
+        pkt.ned_vy = drone.vy;
+        pkt.ned_vz = drone.vz;
+        pkt.q_w = drone.q[0];  pkt.q_x = drone.q[1];
+        pkt.q_y = drone.q[2];  pkt.q_z = drone.q[3];
+        pkt.roll_rate  = drone.rollspeed;
+        pkt.pitch_rate = drone.pitchspeed;
+        pkt.yaw_rate   = drone.yawspeed;
+        pkt.roll_rad   = drone.roll;
+        pkt.pitch_rad  = drone.pitch;
+        pkt.px4_pos_boot_ms = drone.pos_boot_ms;
+        pkt.px4_att_boot_ms = drone.att_boot_ms;
+        pkt.q_from_px4 = drone.q_from_px4;
 
-        /* ---- Send raw ToF debug frame (front sensor only) ---- */
-        {
+        clock_sync_status_t sync=mavlink_clock_status();
+        experiment_status_t exp=experiment_status();
+        pkt.esp_send_us=esp_timer_get_time();
+        pkt.clock_offset_us=sync.offset_us; pkt.sync_rtt_us=sync.rtt_us;
+        pkt.sync_age_us=sync.age_us; pkt.sync_samples=sync.samples;
+        pkt.sync_locked=sync.locked; pkt.experiment_phase=exp.phase;
+        pkt.mission_id=exp.id; pkt.corner=exp.corner;
+#if CONFIG_EXPERIMENT_WITHOUT_TOF
+        pkt.tof_side=0; pkt.tof_hz=0;
+#else
+        pkt.tof_side=TOF_NATIVE_SIDE; pkt.tof_hz=TOF_RANGING_FREQ_HZ;
+#endif
+#if CONFIG_NANOLITE_BENCH_MODE
+        pkt.passive=1;
+#endif
+        pkt.boot_id=s_boot_id;
+        /* ---- Send telemetry ---- */
+        send(tx_sock, &pkt, sizeof(pkt), MSG_DONTWAIT);
+
+        /* ---- Send all raw ToF frames, preserving each acquisition time ---- */
+#if CONFIG_TOF_LEGACY_DEBUG && !CONFIG_EXPERIMENT_WITHOUT_TOF
+        if (TOF_NATIVE_SIDE==8 && tick_us-last_debug_us>=100000) {
+            last_debug_us=tick_us;
             tof_scan_t scan = tof_get_scan();
-            wifi_tof_debug_pkt_t dbg = {};
-            dbg.pkt_type    = WIFI_PKT_TOF_DEBUG;
-            dbg.sensor_idx  = TOF_FRONT_SENSOR_IDX;
-            dbg.sensor_ok   = scan.sensor_ok[TOF_FRONT_SENSOR_IDX];
-            dbg.timestamp_ms = scan.frame[TOF_FRONT_SENSOR_IDX].timestamp_ms;
-            memcpy(dbg.distance_mm,   scan.frame[TOF_FRONT_SENSOR_IDX].distance_mm,
-                   sizeof(dbg.distance_mm));
-            memcpy(dbg.target_status, scan.frame[TOF_FRONT_SENSOR_IDX].target_status,
-                   sizeof(dbg.target_status));
-            send(tof_sock, &dbg, sizeof(dbg), 0);
+            const uint32_t sent_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            for (uint8_t sensor = 0; sensor < TOF_SENSOR_COUNT; ++sensor) {
+                wifi_tof_debug_pkt_t dbg = {};
+                dbg.pkt_type     = WIFI_PKT_TOF_DEBUG;
+                dbg.sensor_idx   = sensor;
+                dbg.sensor_ok    = scan.sensor_ok[sensor];
+                dbg.timestamp_ms = scan.frame[sensor].timestamp_ms;
+                dbg.sent_ms      = sent_ms;
+                memcpy(dbg.distance_mm, scan.frame[sensor].distance_mm,
+                       sizeof(dbg.distance_mm));
+                memcpy(dbg.target_status, scan.frame[sensor].target_status,
+                       sizeof(dbg.target_status));
+                send(tof_sock, &dbg, sizeof(dbg), MSG_DONTWAIT);
+            }
         }
 
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(100));   /* 10 Hz */
+#endif
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1));
     }
 }
 

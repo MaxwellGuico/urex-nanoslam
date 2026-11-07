@@ -213,3 +213,8 @@ uint8_t VL53L5CX_WaitMs(
 #ifdef __cplusplus
 }
 #endif
+
+#ifdef CONFIG_VL53L5CX_MUXED_BUS
+/* Caller holds bus_mutex when invalidating after an I2C reset. */
+void VL53L5CX_InvalidateMuxCache(void);
+#endif

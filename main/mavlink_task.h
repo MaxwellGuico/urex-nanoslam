@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "clock_sync.h"
 
 // ---------------------------------------------------------------------------
 // Configuration — adjust to your hardware
@@ -21,6 +22,8 @@
 
 // PX4 custom main mode — used to verify mode switches via drone_state_t
 #define PX4_MAIN_MODE_OFFBOARD  6
+#define PX4_MAIN_MODE_AUTO      4
+#define PX4_SUB_MODE_AUTO_LAND  6   // with PX4_MAIN_MODE_AUTO
 
 // FreeRTOS placement — Core 0, highest priority to meet 20Hz hard deadline
 #define MAV_TASK_CORE       0
@@ -39,6 +42,15 @@ typedef struct {
 
     // Heading: radians, 0 = North, clockwise positive (from ATTITUDE)
     float heading;
+
+    // Full attitude (raw PX4 values, for logging).
+    float roll, pitch;                       // rad (ATTITUDE)
+    float rollspeed, pitchspeed, yawspeed;   // body rates, rad/s (ATTITUDE / ATTITUDE_QUATERNION)
+    float q[4];                              // w, x, y, z (ATTITUDE_QUATERNION, else built from ATTITUDE)
+    uint8_t q_from_px4;                      // 1 = q came from ATTITUDE_QUATERNION, 0 = from ATTITUDE euler
+    uint32_t pos_boot_ms;                    // PX4 time_boot_ms of the last LOCAL_POSITION_NED
+    uint32_t att_boot_ms;                    // PX4 time_boot_ms of the last attitude message
+    uint32_t last_q_ms;                      // ESP time of the last ATTITUDE_QUATERNION
 
     // Derived ENU-Z for altitude controller convenience (= -z)
     float enu_z;
@@ -113,3 +125,5 @@ drone_state_t mavlink_get_state(void);
 // Convenience: true if we have received position data recently (< 500ms)
 bool mavlink_position_valid(void);
 
+
+clock_sync_status_t mavlink_clock_status(void);

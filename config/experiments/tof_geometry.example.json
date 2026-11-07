@@ -1,0 +1,9 @@
+{
+  "calibrated": false,
+  "description": "Starting approximation only: front sensor index 1, CCW ring. Measure offsets and verify zone order/FOV/range model before metric use.",
+  "sensor_yaw_deg_cw": [45, 0, 315, 270, 225, 180, 135, 90],
+  "sensor_xy_body_frd_m": [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]],
+  "horizontal_fov_deg": 45,
+  "column_zero_clockwise": true,
+  "distance_model": "radial"
+}

@@ -1,6 +1,9 @@
 idf_component_register(
     SRCS
         "main.c"
+        "clock_sync.c"
+        "experiment_task.c"
+        "experiment_plan.c"
         "mavlink_task.c"
         "nanolite_task.c"
         "tof_task.c"

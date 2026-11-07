@@ -10,6 +10,7 @@
 #include "at_detect.h"
 #include "wifi_task.h"
 #include "odom.h"
+#include "experiment_task.h"
 
 #include <math.h>
 
@@ -35,7 +36,7 @@ static const char *TAG = "mission";
  *   2. nav_set_goal_map() is called — nav_task takes over setpoints
  *   3. nav_cancel() restores ownership to mission_task for landing
  * --------------------------------------------------------------------------- */
-#if !CONFIG_NANOLITE_BENCH_MODE
+#if !CONFIG_NANOLITE_BENCH_MODE && !CONFIG_EXPERIMENT_MISSION_ENABLED
 static void mission_task(void *arg)
 {
     bool  nav_goal_active = false;
@@ -326,6 +327,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_err);
 
     /* Init all modules before spawning tasks */
+    experiment_init();
     mavlink_task_init();
     nanolite_task_init();
     tof_task_init();
@@ -339,18 +341,24 @@ void app_main(void)
         mavlink_task, "mav", MAV_TASK_STACK,
         NULL, MAV_TASK_PRIORITY, NULL, MAV_TASK_CORE
     );
+#if !CONFIG_EXPERIMENT_WITHOUT_TOF
     xTaskCreatePinnedToCore(
         tof_task, "tof", TOF_TASK_STACK,
         NULL, TOF_TASK_PRIORITY, NULL, TOF_TASK_CORE
     );
+#else
+    ESP_LOGW(TAG, "BASELINE FLIGHT: ToF acquisition disabled; no ToF obstacle checks");
+#endif
     xTaskCreatePinnedToCore(
         wifi_task, "wifi", WIFI_TASK_STACK,
         NULL, WIFI_TASK_PRIORITY, NULL, WIFI_TASK_CORE
     );
+#if CONFIG_NANOLITE_ENABLED
     xTaskCreatePinnedToCore(
         nanolite_task, "nanolite", NANOLITE_TASK_STACK,
         NULL, NANOLITE_TASK_PRIORITY, NULL, NANOLITE_TASK_CORE
     );
+#endif
 
 #if CONFIG_APRILTAG_CAMERA_ENABLED
     /* Core 1 is dedicated to the optional camera/AprilTag pipeline. */
@@ -372,6 +380,8 @@ void app_main(void)
     ESP_LOGI(TAG,
              "Core 0 runs MAVLink/ToF/Wi-Fi/NanoSLAM-Lite; Core 1 is reserved");
 #endif
+#elif CONFIG_EXPERIMENT_MISSION_ENABLED
+    xTaskCreatePinnedToCore(experiment_task, "experiment", 6144, NULL, 3, NULL, 1);
 #else
     /* Core 1: navigator (Pri 3) + mission (Pri 2)
      * nav_task preempts mission_task on Core 1 when it has work. */

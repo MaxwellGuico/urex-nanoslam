@@ -1,0 +1,51 @@
+{
+  "calibrated": false,
+  "description": "Measured 2026-11-07: ring centred directly above the PX4 (2.8 cm higher; not used by the planar model). Opposite-sensor spacing S1-S5 7.8 cm, S3-S7 7.8 cm, S2-S6 6.7 cm, S4-S0 6.7 cm, so radius 3.9 cm (front/back/left/right) and 3.35 cm (diagonals). Sensor headings, zone order, FOV and distance model are still the uncalibrated defaults.",
+  "sensor_yaw_deg_cw": [
+    45,
+    0,
+    315,
+    270,
+    225,
+    180,
+    135,
+    90
+  ],
+  "sensor_xy_body_frd_m": [
+    [
+      0.0237,
+      0.0237
+    ],
+    [
+      0.039,
+      0.0
+    ],
+    [
+      0.0237,
+      -0.0237
+    ],
+    [
+      -0.0,
+      -0.039
+    ],
+    [
+      -0.0237,
+      -0.0237
+    ],
+    [
+      -0.039,
+      0.0
+    ],
+    [
+      -0.0237,
+      0.0237
+    ],
+    [
+      0.0,
+      0.039
+    ]
+  ],
+  "horizontal_fov_deg": 45,
+  "column_zero_clockwise": true,
+  "distance_model": "radial"
+}
