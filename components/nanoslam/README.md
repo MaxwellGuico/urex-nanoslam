@@ -16,26 +16,51 @@ be accompanied by, or offer, the corresponding source.
 
 | File | Role |
 | --- | --- |
-| `scan.c` | Reduce each 8x8 frame to one range per column (median of rows 2-5, rows must agree within 100 mm), project 5 frames x 8 sensors x 8 columns to points |
-| `slam_graph.c` | Up to 64 poses and their scans (scans in PSRAM) |
+| `scan.c` | Reduce each frame to one range per column (median of the centre rows: 2-5 of 8x8, 1-2 of 4x4; rows must agree within 100 mm), project 5 frames x 8 sensors x 8 (or 4) columns to points |
+| `slam_graph.c` | Up to 64 poses, their raw odometry poses and scans (scans in PSRAM) |
 | `icp/icp_line.c` | Point-to-line ICP (default), ported from `laptop/offline_slam.py` |
 | `icp/icp.c` | Point-to-point ICP with SVD (ETH/Friess), selectable |
-| `slam.c` | ICP constraints between consecutive scans and to the closest earlier pose (loop closure), gated on correction size and inlier ratio, then `ls_slam` |
-| `ls-slam/` | ETH Gauss-Newton solver: sparse H, reverse Cuthill-McKee ordering, sparse Cholesky, 3 iterations |
+| `slam.c` | ICP constraints between consecutive scans and to the closest earlier pose (loop closure), gated on correction size and match quality, then `ls_slam_odometry` with raw-odometry edges and per-axis weights |
+| `ls-slam/` | ETH Gauss-Newton solver: sparse H, reverse Cuthill-McKee ordering, sparse Cholesky, 3 iterations; per-axis edge weights added |
 
-## Changes from Duncan's version
+ToF settings that matter for SLAM are recorded in
+[`experiments/tof-integration-time-2026-11-08.md`](../../experiments/tof-integration-time-2026-11-08.md).
 
-- Constraint off-diagonal Hessian entries are accumulated, not overwritten. A sequential-ICP
-  constraint shares its pose pair with an odometry edge; overwriting gave `-20` instead of `-21`
-  and a wrong step (ETH only had loop constraints, so it never hit this).
-  `test_sequential_constraints_combine_with_odometry` covers it.
-- Sparse matrix capacity overflow is detected; `ls_slam` then returns false and leaves the poses
-  unchanged, instead of silently dropping entries.
-- Solver matrices hold a full lower triangle (cannot overflow; ETH's 9 x MAX_SIZE overflowed on a
-  real 34-pose flight) and are heap-allocated in PSRAM instead of ~30 KB of stack.
-- Sensor headings come from the ToF task's angle table; acquisition moved to `main/`.
-- Single drone: the swarm ID/broadcast layer and the onboard occupancy grid are not ported. The
-  map is built on the laptop (`laptop/nanoslam_receive.py`).
+## Differences from ETH NanoSLAM and Duncan's port
+
+Summary of everything that behaves differently from ETH's gap9-app solver and Duncan's
+`combine_2` port, with the evidence for each. Details follow in the sections below.
+
+| # | ETH / Duncan | This implementation | Why |
+| --- | --- | --- | --- |
+| 1 | Point-to-point ICP (SVD) | Point-to-line ICP (`CONFIG_NANOSLAM_ICP_POINT_TO_LINE`, default on) | Point-to-point slides scans along walls (2.4 deg / 81 mm on resampled walls); maps 0.3-0.4 cm sharper on real flights |
+| 2 | Odometry edges computed from the current pose estimates | Odometry edges from the raw (jump-free) PX4 poses | In flight the graph is solved, committed and solved again every 5 poses; ETH's form re-counts each earlier correction. Replay: halves the map twist on big flights |
+| 3 | ICP edges 20x the information of odometry, in every axis (x, y, yaw alike) | Per-axis: odometry 8 cm / 1 deg, ICP 3 cm / 3 deg (`CONFIG_NANOSLAM_ETH_WEIGHTS` restores ETH) | PX4's gyro heading (~0.03 deg/s drift) is much better than one ICP match (+-1-2 deg); ETH's weights let ICP noise rotate whole maps 3-7 deg |
+| 4 | Constraint off-diagonal Hessian entries inserted (overwrite) | Accumulated | A sequential constraint shares its pose pair with an odometry edge; overwriting gave -20 instead of -21 and a wrong step (Duncan's code only; ETH had no sequential constraints) |
+| 5 | Sparse capacity 9 x MAX_SIZE, overflow silently drops entries | Full lower triangle in PSRAM; overflow detected, solve rejected | A real 34-pose flight needed 1748 > 1728 entries |
+| 6 | Solver matrices on the stack (~30 KB, Duncan) | Static / PSRAM | An 8 KB optimiser stack overflowed mid-flight (2026-11-07) |
+| 7 | At most 64 constraints | 128, uploaded in chunks | A 43-pose flight hit 64 exactly, dropping loop closures |
+| 8 | 8x8 only, 4 sensors rotated (ETH) / fixed headings (Duncan) | 8x8 or 4x4; headings from the ToF angle table | 4x4 profile support |
+| 9 | Swarm graph, onboard occupancy grid (Duncan) | Single drone; graph uploaded after landing, map built on the laptop | Project design |
+
+### Edge weighting and odometry (items 2 and 3)
+
+Host replays of four 2026-11-08 8x8 flights with the drone's in-flight schedule (optimise and
+commit every 5 poses, final pass after landing). Map rotation = mean wall angle relative to
+PX4's frame; PX4's own heading was stable within ~2 deg on every flight. The "old" replay
+reproduces what the drone actually produced in flight to 0.1 deg.
+
+| Flight | Raw PX4 rotation | Old (ETH) | Raw odometry, ETH weights | Raw odometry + per-axis | Wall spread old / new |
+| --- | --- | --- | --- | --- | --- |
+| Small room, run 1 | +0.7 deg | -2.9 deg | -2.9 deg | **-0.7 deg** | 6.6 / 6.6 cm |
+| Small room, run 2 | -4.8 deg | -5.7 deg | -6.0 deg | **-5.2 deg** | 6.6 / 6.6 cm |
+| 4 x 5.5 m, run 7 (5 ms) | -1.2 deg | -6.2 deg | -3.3 deg | **-1.8 deg** | left wall 5.9 / 6.3 cm |
+| 4 x 5.5 m, run 15 (10 ms) | -1.2 deg | -7.0 deg | -4.6 deg | **-4.5 deg** | left wall 5.4 / 5.4 cm |
+
+Run 15 keeps about 3 deg of residual rotation; the remaining ICP heading evidence there is
+consistently biased (sparse scans around takeoff). Unit tests: `test_weights_reproduce_eth`,
+`test_per_axis_weights_keep_good_heading` (ETH 4.9 deg vs per-axis 0.5 deg heading error),
+`test_repeated_passes_do_not_compound`.
 
 ## ICP method
 
