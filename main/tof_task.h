@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "driver/i2c_master.h"
-#include "nanolite_tof.h"
 #include "clock_sync.h"
 #include "sdkconfig.h"
 
@@ -17,11 +16,14 @@
 #define TOF_SCL_PIN             CONFIG_TCA_SCL_GPIO_PORT
 #define TCA_I2C_ADDR            0x70
 #define TOF_RANGING_FREQ_HZ     CONFIG_TOF_RATE_HZ
-#define TOF_INTEGRATION_MS      5U
+#define TOF_INTEGRATION_MS      ((uint32_t)CONFIG_TOF_INTEGRATION_MS)
 #define TOF_NATIVE_SIDE         CONFIG_TOF_GRID_SIZE
 #define TOF_NATIVE_PIXELS       (TOF_NATIVE_SIDE * TOF_NATIVE_SIDE)
 #if (TOF_NATIVE_SIDE != 4 && TOF_NATIVE_SIDE != 8) || (TOF_NATIVE_SIDE == 8 && TOF_RANGING_FREQ_HZ > 15)
 #error "Supported ToF profiles: 8x8 up to 15 Hz, 4x4 up to 60 Hz"
+#endif
+#if CONFIG_TOF_INTEGRATION_MS + 6 > 1000 / CONFIG_TOF_RATE_HZ
+#error "TOF_INTEGRATION_MS must leave >= 6 ms of each ranging period (1000/TOF_RATE_HZ)"
 #endif
 #define TOF_MAX_VALID_MM        3000    // discard readings above this (sensor max is 4m)
 #define TOF_MIN_VALID_MM        50      // discard readings below this (sensor blind zone)
@@ -112,13 +114,6 @@ float tof_get_min_range_in_sector(float angle_min_deg, float angle_max_deg);
 // Full scan snapshot — returns a copy of the latest scan data.
 // Use for telemetry or when you need all readings at once.
 tof_scan_t tof_get_scan(void);
-
-/* Reduce the newest ring frames for mapping using zero-based rows 3 and 4.
- * Invalid/no-target returns remain invalid and therefore do not clear unknown
- * map space. Returns the number of valid reduced observations. */
-uint8_t tof_get_mapping_returns(
-    uint16_t map_effective_range_mm,
-    nanolite_tof_return_t returns[TOF_SENSOR_COUNT]);
 
 /* Body-frame sensor center bearing, degrees clockwise from the vehicle nose. */
 float tof_sensor_angle_deg(uint8_t sensor_id);

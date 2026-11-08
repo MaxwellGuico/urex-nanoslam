@@ -76,6 +76,8 @@ typedef struct __attribute__((packed)) {
     uint32_t mission_id;
     uint8_t corner, tof_side, tof_hz, passive;
     uint32_t boot_id;
+    /* Appended extension 3 (166 bytes): ToF integration time, 0 = ToF off */
+    uint8_t tof_integration_ms;
 } wifi_telem_pkt_t;
 
 /* 88-byte native frame header, then side*side int16 distances and uint8 statuses.

@@ -64,9 +64,23 @@ def decode_native(data: bytes) -> NativeFrame | None:
     return NativeFrame(drone,sensor,rows,hz,flags,boot,seq,drops,rb,ra,rs,re,previous,
                        sent,offset,rtt,age,size,stream,samples,distances,statuses)
 
+# Firmware mission codes (main/experiment_task.h). 'rectangle-centred' takes
+# off at the middle of the bottom (south) edge and needs firmware with mode 3.
+MODE_CODES={'takeoff-land':1,'rectangle':2,'rectangle-centred':3}
+
+def mission_waypoints(mode: str, width=1., length=1.):
+    """(north, east) waypoints relative to takeoff, as experiment_waypoint()
+    in main/experiment_plan.c flies them. First = takeoff, last = landing."""
+    if mode=='rectangle':
+        return [(0,0),(length,0),(length,width),(0,width),(0,0)]
+    if mode=='rectangle-centred':
+        h=width/2
+        return [(0,0),(0,-h),(length,-h),(length,h),(0,h),(0,0)]
+    return [(0,0)]
+
 def build_experiment(mission_id: int, mode: str, width=1., length=1., altitude=.5, speed=.3):
-    if not 0<mission_id<2**32 or mode not in ('takeoff-land','rectangle'):
+    if not 0<mission_id<2**32 or mode not in MODE_CODES:
         raise ValueError('Invalid mission ID or mode')
     for value,low,high in ((width,.2,10),(length,.2,10),(altitude,.3,2),(speed,.05,.5)):
         if not math.isfinite(value) or not low<=value<=high: raise ValueError('Mission parameters outside firmware limits')
-    return COMMAND.pack(2,7,1 if mode=='takeoff-land' else 2,mission_id,width,length,altitude,speed)
+    return COMMAND.pack(2,7,MODE_CODES[mode],mission_id,width,length,altitude,speed)

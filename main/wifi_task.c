@@ -26,7 +26,7 @@ static const char *TAG = "wifi";
 static uint32_t s_boot_id;
 _Static_assert(sizeof(wifi_tof_record_header_t)==88, "Native record header changed");
 
-_Static_assert(sizeof(wifi_telem_pkt_t) == 165, "Telemetry wire layout changed");
+_Static_assert(sizeof(wifi_telem_pkt_t) == 166, "Telemetry wire layout changed");
 _Static_assert(sizeof(wifi_tof_debug_pkt_t) == 203, "ToF debug wire layout changed");
 
 /* Cruise altitude for CMD_GOTO — must match CRUISE_ALT_M in main.c */
@@ -446,11 +446,12 @@ void wifi_task(void *arg)
         pkt.sync_locked=sync.locked; pkt.experiment_phase=exp.phase;
         pkt.mission_id=exp.id; pkt.corner=exp.corner;
 #if CONFIG_EXPERIMENT_WITHOUT_TOF
-        pkt.tof_side=0; pkt.tof_hz=0;
+        pkt.tof_side=0; pkt.tof_hz=0; pkt.tof_integration_ms=0;
 #else
         pkt.tof_side=TOF_NATIVE_SIDE; pkt.tof_hz=TOF_RANGING_FREQ_HZ;
+        pkt.tof_integration_ms=(uint8_t)TOF_INTEGRATION_MS;
 #endif
-#if CONFIG_NANOLITE_BENCH_MODE
+#if CONFIG_BENCH_MODE
         pkt.passive=1;
 #endif
         pkt.boot_id=s_boot_id;

@@ -5,6 +5,9 @@
 #define CMD_EXPERIMENT 0x07
 #define EXPERIMENT_TAKEOFF_LAND 1
 #define EXPERIMENT_RECTANGLE 2
+/* Rectangle whose takeoff point is the middle of its bottom (south) edge,
+ * flown clockwise: W to the SW corner, N, E, S, then W back to takeoff. */
+#define EXPERIMENT_RECTANGLE_CENTRED 3
 /* Phase is included in telemetry, and every phase transition is recorded by host. */
 typedef enum {
     EXP_IDLE, EXP_PRESTREAM, EXP_OFFBOARD, EXP_ARM, EXP_TAKEOFF,

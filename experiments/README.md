@@ -1,4 +1,11 @@
-# NanoSLAM-Lite bench experiments
+# NanoSLAM-Lite bench experiments (historical)
+
+> **NanoSLAM-Lite was removed on 2026-11-07.** This guide and the logs below record the earlier
+> bench work; its viewers (`laptop/nanolite_run_view.py`, `nanolite_map_view.py`) and the
+> `CONFIG_NANOLITE_*` options are only in git history (`CONFIG_NANOLITE_BENCH_MODE` is now
+> `CONFIG_BENCH_MODE`). For the current onboard NanoSLAM (ICP + LS-SLAM, map built on the laptop)
+> see the main [README](../README.md#onboard-nanoslam-and-the-laptop-map) and
+> [UREX_INTEGRATION.md](../UREX_INTEGRATION.md).
 
 This guide makes the current ESP32-S3 NanoSLAM-Lite tests repeatable. It covers the props-off NUS
 flight application, log capture, map rendering, pass/fail checks, and the order of the next

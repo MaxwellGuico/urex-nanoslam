@@ -288,7 +288,7 @@ rate.
 
 ## Files and alignment
 
-Each invocation creates a new `results/experiments/<timestamp>/` directory;
+Each invocation creates a new `results/experiments/<profile>_run<N>_<date>_<time>/` directory (e.g. `4x4_30hz_run2_20261108_162517`; N counts runs of that ToF profile that day);
 `--output <new-directory>` chooses another location.
 
 | File | Contents |

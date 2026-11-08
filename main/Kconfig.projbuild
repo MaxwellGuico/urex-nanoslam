@@ -91,7 +91,7 @@ menu "Drone Configuration"
         default n
         help
           Start the camera and AprilTag detector on Core 1. Leave this disabled
-          while validating the Core 0 ToF and NanoSLAM-Lite pipeline. The
+          while validating the Core 0 ToF and NanoSLAM pipeline. The
           camera state APIs remain initialized and report no detections, so
           telemetry callers can continue safely. In bench mode, disabling this
           option leaves Core 1 available for future camera work.
@@ -118,13 +118,19 @@ menu "Drone Configuration"
           The laptop must explicitly submit an experiment command. Bench builds
           always remain passive. No navigation task runs in this mode.
 
-    config NANOLITE_ENABLED
-        bool "Run NanoSLAM-Lite task"
+    config NANOSLAM_ENABLED
+        bool "Run the NanoSLAM task (ICP + pose-graph optimisation)"
         default y
+        help
+          Records a pose and a 400 ms ToF scan every NANOSLAM_RECORD_INTERVAL_MS
+          while armed, runs ICP + LS-SLAM in the background, and after
+          disarming sends the optimised graph to the laptop over Wi-Fi, where
+          laptop/nanoslam_receive.py builds the map. It never sends setpoints
+          and does not feed navigation.
 
     config EXPERIMENT_WITHOUT_TOF
         bool "Disable ToF acquisition and obstacle checks for baseline flights"
-        depends on EXPERIMENT_MISSION_ENABLED && !NANOLITE_ENABLED && !NANOLITE_BENCH_MODE
+        depends on EXPERIMENT_MISSION_ENABLED && !NANOSLAM_ENABLED && !BENCH_MODE
         default n
         help
           Only for staged takeoff/land and rectangle flight baselines. Do not
@@ -150,6 +156,17 @@ menu "Drone Configuration"
         int "Native ToF rate (Hz)"
         range 1 60
         default 15
+
+    config TOF_INTEGRATION_MS
+        int "ToF integration time (ms)"
+        range 2 100
+        default 5
+        help
+          Per-frame integration time of each VL53L5CX (autonomous mode). Longer
+          integration collects more signal, so farther and darker surfaces
+          return a target instead of "no target", at slightly higher power. It
+          must leave a few ms of each frame period: at most 1000/TOF_RATE_HZ - 6
+          (60 ms at 15 Hz, 27 ms at 30 Hz). ST's default is 20 ms.
 
     config DATA_TELEM_HZ
         int "Laptop PX4 telemetry snapshot rate (Hz)"
@@ -201,104 +218,98 @@ menu "Drone Configuration"
         help
           GPIO PX4 RX PIN
 
-    config NANOLITE_POSE_RATE_HZ
-        int "NanoSLAM-Lite pose observation rate (Hz)"
+    config PX4_POSE_RATE_HZ
+        int "PX4 position/attitude stream rate (Hz)"
         range 5 100
         default 20
         help
-          Rate at which the read-only NanoSLAM-Lite task samples the fused PX4
-          LOCAL_POSITION_NED and ATTITUDE state. This does not change MAVLink
-          setpoints or flight-control behaviour.
+          Rate requested from PX4 for LOCAL_POSITION_NED, ATTITUDE and
+          ATTITUDE_QUATERNION. This does not change setpoint behaviour.
 
-    config NANOLITE_BENCH_MODE
-        bool "NanoSLAM-Lite props-off bench mode"
+    config BENCH_MODE
+        bool "Props-off bench mode"
         default y
         help
-          Keep telemetry, ToF, Wi-Fi, and NanoSLAM-Lite active, but do not
-          spawn the navigation or mission tasks. Camera detection is controlled
-          separately by APRILTAG_CAMERA_ENABLED. This prevents this development
-          image from arming or flying the vehicle. Disable only after props-off
-          validation and a flight-readiness review.
+          Keep telemetry, ToF, Wi-Fi, and NanoSLAM active, but do not spawn the
+          navigation or mission tasks and never publish setpoints. Camera
+          detection is controlled separately by APRILTAG_CAMERA_ENABLED.
+          Disable only after props-off validation and a flight-readiness review.
 
-    config NANOLITE_POSE_MAX_AGE_MS
-        int "Maximum NanoSLAM-Lite PX4 pose age (ms)"
-        range 50 1000
-        default 250
+    config NANOSLAM_RECORD_INTERVAL_MS
+        int "NanoSLAM pose + scan interval (ms)"
+        depends on NANOSLAM_ENABLED
+        range 600 10000
+        default 1500
         help
-          Position and attitude older than this are rejected rather than added
-          to the pose graph.
+          One graph node and one 400 ms scan per interval. The graph holds 64
+          nodes, so 1500 ms covers 96 s of flight.
 
-    config NANOLITE_KEY_TRANSLATION_CM
-        int "NanoSLAM-Lite key-pose translation threshold (cm)"
-        range 5 200
-        default 25
+    config NANOSLAM_INFLIGHT_EVERY_N
+        int "Optimise in flight every N poses (0 = only after landing)"
+        depends on NANOSLAM_ENABLED
+        range 0 64
+        default 5
+
+    config NANOSLAM_MAX_SHIFT_CM
+        int "Reject an in-flight optimisation that moves the newest pose by more than (cm)"
+        depends on NANOSLAM_ENABLED
+        range 5 500
+        default 50
         help
-          A new graph pose is stored after at least this much horizontal motion.
+          Protects the live map frame from a bad loop closure. The
+          post-flight optimisation is not limited.
 
-    config NANOLITE_KEY_YAW_DEG
-        int "NanoSLAM-Lite key-pose yaw threshold (degrees)"
-        range 1 90
-        default 15
+    config NANOSLAM_RECORD_DISARMED
+        bool "Also record while disarmed (hand-carried bench tests)"
+        depends on NANOSLAM_ENABLED
+        default n
         help
-          A new graph pose is stored after at least this much heading change.
+          Record from boot without arming. When the graph is full the result is
+          optimised and uploaded once. Arming still starts a fresh graph.
 
-    config NANOLITE_MAP_EFFECTIVE_RANGE_MM
-        int "NanoSLAM-Lite mapping range limit (mm)"
-        range 100 4000
-        default 2000
-        help
-          Maximum ToF hit range admitted to the 2D map. A return outside this
-          gate does not mark an occupied endpoint or clear unknown space.
-
-    config NANOLITE_MAP_TOF_MAX_AGE_MS
-        int "Maximum ToF frame age for mapping (ms)"
-        range 50 1000
-        default 250
-        help
-          Reject stale ToF frames rather than projecting them using the latest
-          PX4 pose. The ring normally refreshes in about 64 ms.
-
-    config NANOLITE_TOF_BENCH_TELEMETRY
-        bool "Emit reduced ToF calibration records"
-        depends on NANOLITE_BENCH_MODE
+    config NANOSLAM_ICP_POINT_TO_LINE
+        bool "Use point-to-line ICP (as laptop/offline_slam.py)"
+        depends on NANOSLAM_ENABLED
         default y
         help
-          Emit versioned NANOTOF records containing each sensor's reduced
-          distance, winning column, validity, source timestamp, and age. This
-          is rate-limited bench telemetry and is excluded from flight builds.
+          Matches each new scan to local wall lines in the reference scan
+          instead of to individual points. Removes the sideways bias of
+          ETH/Duncan's point-to-point ICP on walls and rejects single-wall
+          scans. Disable to use the original point-to-point ICP.
 
-    config NANOLITE_TOF_BENCH_INTERVAL_MS
-        int "Reduced ToF calibration record interval (ms)"
-        depends on NANOLITE_TOF_BENCH_TELEMETRY
-        range 200 10000
-        default 1000
+    config NANOSLAM_ETH_WEIGHTS
+        bool "Use ETH/Duncan's original edge weights (for comparison)"
+        depends on NANOSLAM_ENABLED
+        default n
         help
-          Interval between NANOTOF calibration records. One record contains
-          all eight reduced sensor returns.
+          Off (default): odometry edges come from the raw PX4 poses and edges
+          are weighted per axis (odometry 8 cm / 1 deg, ICP 3 cm / 3 deg), so
+          PX4's precise gyro heading is not overridden by noisy ICP headings.
+          On: ICP edges get 20x the information of odometry in every axis, as
+          in ETH's code. Odometry edges still come from the raw poses.
 
-    config NANOLITE_MAP_SERIAL_DUMP
-        bool "Emit packed NanoSLAM-Lite map snapshots"
-        depends on NANOLITE_BENCH_MODE
-        default y
+    config NANOSLAM_UPLOAD_PORT
+        int "Laptop UDP port for the post-flight SLAM upload"
+        depends on NANOSLAM_ENABLED
+        range 1 65535
+        default 5008
         help
-          Emit a compact hexadecimal NANOMAP record for bench visualization.
-          Disable for flight once the map telemetry path is integrated.
+          After landing, the optimised graph (raw + optimised poses, scans,
+          ICP constraints) is sent to HOST_IPV4_ADDR on this port.
+          laptop/nanoslam_receive.py listens there and builds the map.
 
-    config NANOLITE_MAP_DUMP_INTERVAL_S
-        int "Packed map snapshot interval (seconds)"
-        depends on NANOLITE_MAP_SERIAL_DUMP
-        range 2 60
-        default 10
+    config NANOSLAM_UPLOAD_REPEATS
+        int "Times the whole upload is sent (UDP has no retransmission)"
+        depends on NANOSLAM_ENABLED
+        range 1 10
+        default 3
 
-    config NANOLITE_GRAPH_SERIAL_DUMP
-        bool "Emit NanoSLAM-Lite pose-graph snapshots"
-        depends on NANOLITE_MAP_SERIAL_DUMP
-        default y
+    config NANOSLAM_SENSOR_OFFSET_MM
+        int "ToF lens distance from the drone centre (mm)"
+        depends on NANOSLAM_ENABLED
+        range 0 200
+        default 37
         help
-          Emit versioned NANOGRAPH, NANONODE, and NANOEDGE records alongside
-          each packed map snapshot. The records contain the corrected key
-          poses, odometry constraints, loop-closure constraints, and current
-          corrected pose needed to reconstruct and plot a complete run. This
-          is bench-only diagnostic output and is excluded from flight builds.
+          Measured 2026-11-07: 39 mm front/back/left/right, 33.5 mm diagonals.
 
 endmenu

@@ -9,6 +9,29 @@ experiment_xy_t experiment_corner(unsigned corner, float length, float width)
     default: return (experiment_xy_t){0,0};
     }
 }
+unsigned experiment_waypoint_count(uint8_t mode)
+{
+    switch (mode) {
+    case 2: return 5;   /* home, 3 corners, home */
+    case 3: return 6;   /* home, 4 corners, home */
+    default: return 1;  /* takeoff-land: home only */
+    }
+}
+experiment_xy_t experiment_waypoint(uint8_t mode, unsigned index, float length, float width)
+{
+    if (mode == 3) {
+        const float half = 0.5f * width;
+        switch (index) {
+        case 1: return (experiment_xy_t){0, -half};       /* SW */
+        case 2: return (experiment_xy_t){length, -half};  /* NW */
+        case 3: return (experiment_xy_t){length, half};   /* NE */
+        case 4: return (experiment_xy_t){0, half};        /* SE */
+        default: return (experiment_xy_t){0, 0};          /* takeoff */
+        }
+    }
+    if (mode == 2) return experiment_corner(index, length, width);
+    return (experiment_xy_t){0, 0};
+}
 bool experiment_settled(float distance, float speed, float tolerance)
 { return distance <= tolerance && speed <= 0.08f; }
 experiment_xy_t experiment_step(experiment_xy_t current, experiment_xy_t goal,

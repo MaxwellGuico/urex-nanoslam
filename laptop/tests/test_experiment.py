@@ -53,6 +53,7 @@ def test_additive_telemetry_and_mission_command():
     assert packet.sync_locked==1 and packet.esp_send_us==1000000
     assert parse_telemetry(data[:125]).sync_locked is None
     assert parse_telemetry(data[:55]).q_w is None
+    assert build_experiment(5,'rectangle-centred',4,5.5,.5,.3)[2]==3
     command=build_experiment(123,'rectangle',2,3,.5,.3)
     assert len(command)==23
     assert struct.unpack('<BBBI4f',command)==pytest.approx((2,7,2,123,2,3,.5,.3))
@@ -88,6 +89,14 @@ int main(void) {
  c=experiment_corner(2,3,2); assert(c.x==3 && c.y==2);
  c=experiment_corner(3,3,2); assert(c.x==0 && c.y==2);
  c=experiment_corner(4,3,2); assert(c.x==0 && c.y==0);
+ /* rectangle from the middle of the bottom edge: W, N, E, S, back */
+ assert(experiment_waypoint_count(3)==6 && experiment_waypoint_count(2)==5 && experiment_waypoint_count(1)==1);
+ c=experiment_waypoint(3,1,5.5f,4); assert(c.x==0 && c.y==-2);
+ c=experiment_waypoint(3,2,5.5f,4); assert(c.x==5.5f && c.y==-2);
+ c=experiment_waypoint(3,3,5.5f,4); assert(c.x==5.5f && c.y==2);
+ c=experiment_waypoint(3,4,5.5f,4); assert(c.x==0 && c.y==2);
+ c=experiment_waypoint(3,5,5.5f,4); assert(c.x==0 && c.y==0);
+ c=experiment_waypoint(2,2,3,2); assert(c.x==3 && c.y==2);
  c=experiment_step((experiment_xy_t){0,0},(experiment_xy_t){1,0},.3,.02);
  assert(fabsf(c.x-.006f)<1e-6 && c.y==0);
  c=experiment_step((experiment_xy_t){.999,0},(experiment_xy_t){1,0},.3,.02);
@@ -211,7 +220,7 @@ def test_prepared_profiles_isolate_flight_and_sensor_workloads(tmp_path,stage,pr
     # A minimal local config avoids copying credentials into test artifacts.
     script=tmp_path/'scripts/prepare_experiment.py'
     script.parent.mkdir(); script.write_text((ROOT/'scripts/prepare_experiment.py').read_text())
-    original='CONFIG_NANOLITE_ENABLED=y\nCONFIG_EXPERIMENT_WITHOUT_TOF=y\nCONFIG_TOF_RATE_HZ=60\n'
+    original='CONFIG_NANOSLAM_ENABLED=y\nCONFIG_EXPERIMENT_WITHOUT_TOF=y\nCONFIG_TOF_RATE_HZ=60\n'
     (tmp_path/'sdkconfig').write_text(original)
     command=[sys.executable,str(script),'--stage',stage]
     if profile is not None: command+=['--profile',profile]
@@ -220,7 +229,7 @@ def test_prepared_profiles_isolate_flight_and_sensor_workloads(tmp_path,stage,pr
     config=tmp_path/f'build-experiments/{stage}-{selected}/sdkconfig'
     lines=config.read_text().splitlines()
     assert ('CONFIG_EXPERIMENT_WITHOUT_TOF=y' in lines)==disabled
-    assert '# CONFIG_NANOLITE_ENABLED is not set' in lines
+    assert '# CONFIG_NANOSLAM_ENABLED is not set' in lines
     assert '# CONFIG_APRILTAG_CAMERA_ENABLED is not set' in lines
     if not disabled:
         assert f'CONFIG_TOF_GRID_SIZE={selected[0]}' in lines

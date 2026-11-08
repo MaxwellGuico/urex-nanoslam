@@ -4,7 +4,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "mavlink_task.h"
-#include "nanolite_task.h"
+#include "slam_bridge.h"
 #include "tof_task.h"
 #include "nav_task.h"
 #include "at_detect.h"
@@ -36,7 +36,7 @@ static const char *TAG = "mission";
  *   2. nav_set_goal_map() is called — nav_task takes over setpoints
  *   3. nav_cancel() restores ownership to mission_task for landing
  * --------------------------------------------------------------------------- */
-#if !CONFIG_NANOLITE_BENCH_MODE && !CONFIG_EXPERIMENT_MISSION_ENABLED
+#if !CONFIG_BENCH_MODE && !CONFIG_EXPERIMENT_MISSION_ENABLED
 static void mission_task(void *arg)
 {
     bool  nav_goal_active = false;
@@ -329,8 +329,10 @@ void app_main(void)
     /* Init all modules before spawning tasks */
     experiment_init();
     mavlink_task_init();
-    nanolite_task_init();
     tof_task_init();
+#if CONFIG_NANOSLAM_ENABLED
+    slam_bridge_init();   /* after tof_task_init: reads the sensor angle table */
+#endif
     nav_task_init();
     at_detect_init();
     odom_init();
@@ -353,10 +355,10 @@ void app_main(void)
         wifi_task, "wifi", WIFI_TASK_STACK,
         NULL, WIFI_TASK_PRIORITY, NULL, WIFI_TASK_CORE
     );
-#if CONFIG_NANOLITE_ENABLED
+#if CONFIG_NANOSLAM_ENABLED
     xTaskCreatePinnedToCore(
-        nanolite_task, "nanolite", NANOLITE_TASK_STACK,
-        NULL, NANOLITE_TASK_PRIORITY, NULL, NANOLITE_TASK_CORE
+        slam_task, "slam", SLAM_TASK_STACK,
+        NULL, SLAM_TASK_PRIORITY, NULL, SLAM_TASK_CORE
     );
 #endif
 
@@ -371,14 +373,14 @@ void app_main(void)
              "AprilTag camera disabled; camera hardware will not be initialized");
 #endif
 
-#if CONFIG_NANOLITE_BENCH_MODE
+#if CONFIG_BENCH_MODE
     /* Development default: observe the real sensor/estimator workload without
      * starting tasks that can issue navigation or mission flight commands. */
     ESP_LOGW(TAG,
-             "NANOLITE BENCH MODE: navigation and mission tasks are disabled");
+             "BENCH MODE: navigation and mission tasks are disabled");
 #if !CONFIG_APRILTAG_CAMERA_ENABLED
     ESP_LOGI(TAG,
-             "Core 0 runs MAVLink/ToF/Wi-Fi/NanoSLAM-Lite; Core 1 is reserved");
+             "Core 0 runs MAVLink/ToF/Wi-Fi/NanoSLAM; Core 1 is reserved");
 #endif
 #elif CONFIG_EXPERIMENT_MISSION_ENABLED
     xTaskCreatePinnedToCore(experiment_task, "experiment", 6144, NULL, 3, NULL, 1);

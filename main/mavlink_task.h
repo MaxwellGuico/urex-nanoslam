@@ -37,6 +37,13 @@ typedef struct {
     // Position in NED frame, metres (from LOCAL_POSITION_NED)
     float x, y, z;
 
+    // Jump-free position for SLAM: x/y with PX4 estimator position resets
+    // removed (accumulated in slam_off_*). Use x/y for navigation setpoints,
+    // slam_x/y for mapping.
+    float slam_x, slam_y;
+    float slam_off_x, slam_off_y;
+    uint16_t pos_resets;
+
     // Velocity in NED frame, m/s (from LOCAL_POSITION_NED)
     float vx, vy, vz;
 

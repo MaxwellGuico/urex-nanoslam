@@ -114,7 +114,7 @@ int main(int argc,char **argv) {
  d=(drone_state_t){.x=10,.y=-3,.z=2,.heading=.4,.last_pos_ms=1000,.last_att_ms=1000,.last_hb_ms=1000};
  if(scenario==8) d.x=NAN;
  experiment_init();
- request=(experiment_request_t){.id=22,.mode=(scenario==1||scenario==10)?1:2,.width=2,.length=3,.altitude=.5,.speed=.3};
+ request=(experiment_request_t){.id=22,.mode=(scenario==1||scenario==10)?1:(scenario==11?3:2),.width=2,.length=3,.altitude=.5,.speed=.3};
  assert(experiment_submit(&request));
  if(!setjmp(finished)) experiment_task(NULL);
  experiment_status_t status=experiment_status();
@@ -125,6 +125,12 @@ int main(int argc,char **argv) {
    assert(fabsf(d.x-10)<.001f && fabsf(d.y+3)<.001f && fabsf(min_z-1.5)<.001f);
    assert(dwell_count==(scenario==1?1:5));
    if(scenario!=1) {assert(fabsf(max_x-13)<.001f && fabsf(max_y+1)<.001f);}
+ } else if(scenario==11) {
+   /* centred rectangle: takeoff mid bottom edge, corners at E -1..+1 around home */
+   assert(status.phase==EXP_DONE && land_count>0 && dwell_count==6);
+   assert(fabsf(d.x-10)<.001f && fabsf(d.y+3)<.001f);
+   assert(fabsf(max_x-13)<.001f && fabsf(min_x-10)<.001f);
+   assert(fabsf(min_y+4)<.001f && fabsf(max_y+2)<.001f);
  } else if(scenario==2 || scenario==6 || scenario==7) {
    assert(status.phase==EXP_PILOT_TAKEOVER && land_count==0);
  } else if(scenario==3 || scenario==4 || scenario==9) {
@@ -142,10 +148,10 @@ int main(int argc,char **argv) {
 ''')
     binary=tmp_path/'mission'
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Wno-unused-variable',
-        '-DCONFIG_EXPERIMENT_MISSION_ENABLED=1','-DCONFIG_NANOLITE_BENCH_MODE=0',
+        '-DCONFIG_EXPERIMENT_MISSION_ENABLED=1','-DCONFIG_BENCH_MODE=0',
         f'-DCONFIG_EXPERIMENT_WITHOUT_TOF={int(without_tof)}',
         f'-DCONFIG_EXPERIMENT_OBSTACLE_ABORT={int(obstacle_abort)}',
         '-I',str(tmp_path),'-I',str(ROOT/'main'),str(mission),str(simulator),
         str(ROOT/'main/experiment_plan.c'),'-lm','-o',str(binary)],check=True)
-    for scenario in range(11):
+    for scenario in range(12):
         subprocess.run([str(binary),str(scenario)],check=True)

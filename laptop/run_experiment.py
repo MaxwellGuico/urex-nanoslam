@@ -20,7 +20,8 @@ import socket
 import time
 from contextlib import ExitStack
 from protocol import TelemetryPacket, parse_telemetry, CommandPacket, build_command, CMD_LAND
-from experiment_protocol import decode_native, build_experiment, PHASES
+from experiment_protocol import decode_native, build_experiment, mission_waypoints, PHASES
+from run_naming import next_run_name, profile_label
 
 TELEM_FIELDS=['host_receive_ns','host_monotonic_ns','source_ip']+[f.name for f in fields(TelemetryPacket)]
 TOF_FIELDS=['host_receive_ns','host_monotonic_ns','source_ip','drone_id','boot_id','sensor','side','hz',
@@ -47,14 +48,45 @@ def frame_row(frame, received, monotonic, source):
     row.update({f'status_{i:02}':v for i,v in enumerate(frame.statuses)})
     return row
 
+def draw_plan(path: Path, waypoints, args) -> None:
+    """Top view of the planned path, north up, east right, metres from takeoff."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    path.parent.mkdir(parents=True, exist_ok=True)
+    north=[n for n,_ in waypoints]; east=[e for _,e in waypoints]
+    fig,ax=plt.subplots(figsize=(6,7))
+    ax.plot(east,north,'-',color='#3b7dd8',lw=2,label='planned path')
+    for k,((n0,e0),(n1,e1)) in enumerate(zip(waypoints,waypoints[1:])):
+        ax.annotate('',xy=(e0+.55*(e1-e0),n0+.55*(n1-n0)),xytext=(e0+.45*(e1-e0),n0+.45*(n1-n0)),
+                    arrowprops=dict(arrowstyle='->',color='#3b7dd8',lw=2))
+    for k,(n,e) in enumerate(waypoints[1:-1],1):
+        ax.plot(e,n,'o',color='#3b7dd8'); ax.annotate(f'{k}',(e,n),textcoords='offset points',xytext=(6,6))
+    ax.plot(0,0,'s',color='#2e9e5b',ms=10,label='takeoff / landing (0, 0)')
+    ax.annotate('nose / PX4 north',xy=(0,1.0),xytext=(0,.3),ha='center',
+                arrowprops=dict(arrowstyle='->',color='#888'),color='#666',fontsize=8)
+    e_min,e_max,n_min,n_max=min(east),max(east),min(north),max(north)
+    ax.annotate(f'{e_max-e_min:.2f} m',((e_min+e_max)/2,n_max),textcoords='offset points',xytext=(0,8),ha='center')
+    ax.annotate(f'{n_max-n_min:.2f} m',(e_max,(n_min+n_max)/2),textcoords='offset points',xytext=(8,0),va='center',rotation=90)
+    ax.set_xlabel('East (m)'); ax.set_ylabel('North (m)')
+    ax.set_title(f'{args.mode}: {args.width} m x {args.length} m at {args.altitude} m, {args.speed} m/s')
+    ax.set_aspect('equal'); ax.grid(alpha=.3); ax.margins(.15); ax.legend(loc='lower right',fontsize=8)
+    fig.tight_layout(); fig.savefig(path,dpi=130); plt.close(fig)
+
+
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--mode',choices=['manual','takeoff-land','rectangle'],default='manual')
     ap.add_argument('--execute',action='store_true',help='Send the selected autonomous mission command')
     ap.add_argument('--profile',choices=['off','8x8_15','4x4_30','4x4_60'],default='8x8_15',help='Expected sensor profile (off for baseline flight); rejects mismatched firmware')
     ap.add_argument('--record-tof',action='store_true',help='Save every received native ToF frame')
-    ap.add_argument('--width',type=float,default=1.)
-    ap.add_argument('--length',type=float,default=1.)
+    ap.add_argument('--start',choices=['corner','bottom-centre'],default='corner',
+                    help='Rectangle takeoff point: SW corner (default) or middle of the bottom edge '
+                         '(needs firmware with mission mode 3)')
+    ap.add_argument('--plot',type=Path,help='Preview: write the planned path to this PNG '
+                    '(default results/previews/<time>-<mode>.png)')
+    ap.add_argument('--width',type=float,default=1.,help='East-west size (m)')
+    ap.add_argument('--length',type=float,default=1.,help='North (forward) size (m)')
     ap.add_argument('--altitude',type=float,default=.5)
     ap.add_argument('--speed',type=float,default=.3)
     ap.add_argument('--drone-id',type=int,default=0)
@@ -73,14 +105,27 @@ def main(argv=None):
     if args.profile=='off' and args.record_tof:
         ap.error('--record-tof requires an active ToF profile')
     expected_side,expected_hz=(0,0) if args.profile=='off' else (int(args.profile[0]),int(args.profile.split("_")[1]))
+    if args.start!='corner' and args.mode!='rectangle': ap.error('--start only applies to --mode rectangle')
+    mission_mode=('rectangle-centred' if args.start=='bottom-centre' else 'rectangle') if args.mode=='rectangle' else args.mode
     mission_id=secrets.randbelow(2**32-1)+1
-    try: command=build_experiment(mission_id,args.mode if args.mode!='manual' else 'rectangle',
+    try: command=build_experiment(mission_id,mission_mode if args.mode!='manual' else 'rectangle',
                 args.width,args.length,args.altitude,args.speed)
     except ValueError as exc: ap.error(str(exc))
     if args.mode!='manual' and not args.execute:
-        path=f'width={args.width} m east, length={args.length} m north; ' if args.mode=='rectangle' else ''
+        path=(f'width={args.width} m east-west, length={args.length} m north; takeoff at '
+              f'{"the middle of the bottom edge" if args.start=="bottom-centre" else "the SW corner"}; '
+              if args.mode=='rectangle' else '')
         sequence=('3 s stationary at each corner; return to takeoff (0,0), then LAND.'
                   if args.mode=='rectangle' else 'settle, hold 3 s, then LAND.')
+        waypoints=mission_waypoints(mission_mode,args.width,args.length)
+        if len(waypoints)>1:
+            print('Waypoints (north, east) m from takeoff: '+' -> '.join(f'({n:+.2f}, {e:+.2f})' for n,e in waypoints))
+            plot=args.plot or Path('results/previews')/f'{datetime.now():%Y%m%d-%H%M%S}-{mission_mode}.png'
+            try:
+                draw_plan(plot,waypoints,args)
+                print(f'Plan plot: {plot}')
+            except ImportError:
+                print('matplotlib not installed; no plan plot')
         sensors='; no ToF obstacle checks.' if args.profile=='off' else '.'
         print(f'Preview: {args.mode}; {path}'
               f'altitude={args.altitude} m above takeoff; setpoint speed={args.speed} m/s; '
@@ -88,7 +133,9 @@ def main(argv=None):
               'Add --execute when ready to run this mission.')
         return 0
     if args.mode=='manual' and args.execute: ap.error('manual mode only records; omit --execute')
-    directory=args.output or Path('results/experiments')/datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')
+    # <profile>_run<N>_<date>_<time>; the SLAM upload of this flight reuses it
+    directory=args.output or Path('results/experiments')/next_run_name(
+        profile_label(args.profile), datetime.now(), [Path('results/experiments'), Path('results/slam')])
     directory.mkdir(parents=True,exist_ok=False)
     metadata=vars(args).copy(); metadata['output']=str(directory)
     metadata.update(mission_id=mission_id,started_unix_ns=time.time_ns(),schema_version=1,
@@ -96,7 +143,7 @@ def main(argv=None):
         clock='PX4 boot us = ESP monotonic us + clock_offset_us',
         tof_enabled=args.profile!='off',
         tof_ranging_mode='disabled' if args.profile=='off' else 'autonomous',
-        tof_integration_ms=None if args.profile=='off' else 5,
+        tof_integration_ms='reported per packet in telemetry.csv (tof_integration_ms)',
         tof_timestamp='Estimated data-ready time if bracketed, otherwise read end; optical exposure time is not known')
     (directory/'run.json').write_text(json.dumps(metadata,indent=2)+'\n')
     stats={'telemetry_packets':0,'tof_packets':0,'malformed_packets':0,'unsynced_tof':0,

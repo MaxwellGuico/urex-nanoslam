@@ -64,3 +64,18 @@ def test_full_firmware_telemetry_attitude_extension(source):
         assert older is not None
         assert older.q_w is None
         assert older.q_from_px4 is None
+
+
+def test_tof_integration_extension():
+    # 125 bytes up to attitude, + 40 timing (165), + 1 ToF integration byte (166)
+    prefix = struct.pack(
+        "<BBfffBbf32sBHHHHBBB4f", 1, 8, 1., 2., .3, 0, -1, .5,
+        bytes(32), 0, 65535, 10, 20, 30, 1, 1, 6, -1., .1, .2, .3,
+    ) + struct.pack("<9fIIB", .5, -.5, .5, -.5, .1, -.2, .3, -.4, .6, 1, 2, 1)
+    timing = struct.pack("<QqIIHBBIBBBBI", 1, 2, 3, 4, 5, 1, 0, 9, 0, 8, 15, 0, 77)
+    raw = prefix + timing + struct.pack("<B", 20)
+    assert len(raw) == 166
+    pkt = parse_telemetry(raw)
+    assert (pkt.tof_side, pkt.tof_hz, pkt.tof_integration_ms, pkt.boot_id) == (8, 15, 20, 77)
+    # 165-byte packets from older firmware have no integration field
+    assert parse_telemetry(raw[:165]).tof_integration_ms is None

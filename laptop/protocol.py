@@ -65,6 +65,7 @@ _TELEM_KIN_SIZE = struct.calcsize(_TELEM_KIN_FMT)        # 16 bytes
 _TELEM_ATT_FMT = "<9fIIB"
 _TELEM_TIMING_FMT = "<QqIIHBBIBBBBI"
 _TELEM_TIMING_SIZE = struct.calcsize(_TELEM_TIMING_FMT)
+_TELEM_TOF_EXT_FMT = "<B"   # appended: ToF integration time (ms), 0 = ToF off
 _TELEM_ATT_SIZE = struct.calcsize(_TELEM_ATT_FMT)        # 45 bytes
 
 
@@ -116,6 +117,7 @@ class TelemetryPacket:
     tof_hz: Optional[int] = None
     passive: Optional[int] = None
     boot_id: Optional[int] = None
+    tof_integration_ms: Optional[int] = None
 
     @property
     def nav_state_name(self) -> str:
@@ -163,6 +165,11 @@ def parse_telemetry(data: bytes) -> Optional[TelemetryPacket]:
     if len(data) >= timing_start + _TELEM_TIMING_SIZE:
         timing = struct.unpack_from(_TELEM_TIMING_FMT, data, timing_start)
 
+    tof_integration_ms = None
+    ext_start = timing_start + _TELEM_TIMING_SIZE
+    if len(data) >= ext_start + struct.calcsize(_TELEM_TOF_EXT_FMT):
+        (tof_integration_ms,) = struct.unpack_from(_TELEM_TOF_EXT_FMT, data, ext_start)
+
     return TelemetryPacket(
         drone_id    = drone_id,
         ned_x       = ned_x,
@@ -209,6 +216,7 @@ def parse_telemetry(data: bytes) -> Optional[TelemetryPacket]:
         tof_hz = timing[10],
         passive = timing[11],
         boot_id = timing[12],
+        tof_integration_ms = tof_integration_ms,
 
     )
 

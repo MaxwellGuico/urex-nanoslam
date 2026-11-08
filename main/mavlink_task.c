@@ -28,8 +28,8 @@
 #ifndef CONFIG_EXPERIMENT_MISSION_ENABLED
 #define CONFIG_EXPERIMENT_MISSION_ENABLED 0
 #endif
-#ifndef CONFIG_NANOLITE_BENCH_MODE
-#define CONFIG_NANOLITE_BENCH_MODE 0
+#ifndef CONFIG_BENCH_MODE
+#define CONFIG_BENCH_MODE 0
 #endif
 
 static const char *TAG = "mav";
@@ -58,11 +58,16 @@ static uint32_t s_bridge_px4_to_qgc_bytes;
 static uint32_t s_bridge_qgc_to_px4_bytes;
 static uint32_t s_bridge_last_log_ms;
 
-// Pose telemetry required by NanoSLAM-Lite. PX4 may not publish these messages
+// Pose telemetry required by NanoSLAM. PX4 may not publish these messages
 // continuously on every MAVLink port configuration, so request them explicitly
 // and retry only while either stream is stale.
-#define POSE_STREAM_INTERVAL_US       (1000000U / CONFIG_NANOLITE_POSE_RATE_HZ)
+#define POSE_STREAM_INTERVAL_US       (1000000U / CONFIG_PX4_POSE_RATE_HZ)
 #define POSE_STREAM_STALE_MS          1000U
+
+/* A position step this much larger than velocity * dt between two
+ * LOCAL_POSITION_NED samples is a PX4 estimator reset, not motion. 0.25 m in
+ * 50 ms would be 5 m/s of unexplained motion. */
+#define POS_JUMP_MIN_M                0.25f
 #define POSE_STREAM_REQUEST_RETRY_MS  5000U
 
 // ---------------------------------------------------------------------------
@@ -282,7 +287,7 @@ static void request_pose_streams(void)
     request_message_interval(MAVLINK_MSG_ID_ATTITUDE_QUATERNION,
                              POSE_STREAM_INTERVAL_US);
     ESP_LOGI(TAG, "Requested PX4 position + attitude at %d Hz",
-             CONFIG_NANOLITE_POSE_RATE_HZ);
+             CONFIG_PX4_POSE_RATE_HZ);
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +520,27 @@ static void parse_incoming(void)
             mavlink_msg_local_position_ned_decode(&msg, &pos);
 
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            /* Detect PX4 estimator position resets: a step between two
+             * samples far larger than the reported velocity allows. Replace
+             * the step with velocity * dt in the jump-free SLAM position so
+             * SLAM never sees the jump (ported from Duncan's firmware). x/y
+             * stay raw PX4, since setpoints are in PX4's frame. */
+            if (s_state.last_pos_ms != 0) {
+                float dt = (float)(pos.time_boot_ms - s_state.pos_boot_ms) / 1000.0f;
+                if (dt <= 0.0f || dt > 0.5f) dt = 0.05f;
+                float step_x = pos.x - s_state.x, step_y = pos.y - s_state.y;
+                float exp_x = pos.vx * dt, exp_y = pos.vy * dt;
+                float err = hypotf(step_x - exp_x, step_y - exp_y);
+                if (err > POS_JUMP_MIN_M) {
+                    s_state.slam_off_x += step_x - exp_x;
+                    s_state.slam_off_y += step_y - exp_y;
+                    s_state.pos_resets++;
+                    ESP_LOGW(TAG, "PX4 position jump of %.2f m (N%+.2f E%+.2f) removed from SLAM odometry (#%u)",
+                             err, step_x - exp_x, step_y - exp_y, (unsigned)s_state.pos_resets);
+                }
+            }
+            s_state.slam_x = pos.x - s_state.slam_off_x;
+            s_state.slam_y = pos.y - s_state.slam_off_y;
             s_state.x  = pos.x;   s_state.y  = pos.y;   s_state.z  = pos.z;
             s_state.vx = pos.vx;  s_state.vy = pos.vy;  s_state.vz = pos.vz;
             s_state.enu_z     = -pos.z;   // NED z-down → ENU z-up
@@ -799,7 +825,7 @@ void mavlink_task(void *arg)
 
         // Drain UART every millisecond; keep flight setpoints at 20 Hz.
         // Manual/bench images never publish flight-control setpoints.
-        if (!CONFIG_NANOLITE_BENCH_MODE &&
+        if (!CONFIG_BENCH_MODE &&
             (!CONFIG_EXPERIMENT_MISSION_ENABLED || experiment_controls_enabled()) &&
             now_ms - last_sp_ms >= 50) {
             send_setpoint();

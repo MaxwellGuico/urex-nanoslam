@@ -5,7 +5,7 @@ idf_component_register(
         "experiment_task.c"
         "experiment_plan.c"
         "mavlink_task.c"
-        "nanolite_task.c"
+        "slam_bridge.c"
         "tof_task.c"
         "vfh.c"
         "nav_task.c"
@@ -29,7 +29,7 @@ idf_component_register(
         esp_netif
         esp_event
         lwip
-        nanolite
+        nanoslam
 )
 
 # Suppress -Waddress-of-packed-member from MAVLink and VL53L5CX generated headers

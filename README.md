@@ -2,17 +2,18 @@
 
 This repository contains the current ESP-IDF firmware for the UREX/NUS SAFMC drone. The review
 snapshot integrates PX4 MAVLink telemetry, an eight-sensor VL53L5CX ToF ring, AprilTag camera
-processing, Wi-Fi telemetry, and the fixed-memory NanoSLAM-Lite bench pipeline.
+processing, Wi-Fi telemetry, and onboard NanoSLAM (ICP + pose-graph optimisation, ported from
+ETH NanoSLAM via Duncan Lau's ESP32-S3 firmware).
 
-> **Safety:** NanoSLAM-Lite is not flight-validated. Keep the propellers removed and
-> `CONFIG_NANOLITE_BENCH_MODE=y` while reproducing these experiments.
+> **Safety:** NanoSLAM is not flight-validated. It is read-only (it never sends setpoints and does
+> not feed navigation). Keep `CONFIG_BENCH_MODE=y` for props-off work.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
 | `main/` | ESP32-S3 application tasks and hardware integration |
-| `components/nanolite/` | Self-contained NanoSLAM-Lite source, host tests, and design notes |
+| `components/nanoslam/` | NanoSLAM (GPL-3.0): ICP, sparse LS-SLAM solver, scan extraction, pose graph, host tests |
 | `components/rjrp44__vl53l5cx/` | VL53L5CX driver with the project's ESP-IDF integration changes |
 | `components/espressif__esp32-camera/` | Camera driver used by the AprilTag task |
 | `components/esp-apriltag/` | AprilTag detector |
@@ -124,32 +125,36 @@ authentication failed). An association message followed by no `Got IP` message
 indicates that the link connected but IPv4 is not ready.
 
 The review configuration keeps **Enable AprilTag camera task** disabled. MAVLink, ToF, Wi-Fi, and
-NanoSLAM-Lite run on Core 0; no project task is started on Core 1 in bench mode. The camera code is
+NanoSLAM run on Core 0; no project task is started on Core 1 in bench mode. The camera code is
 retained and both its detector and driver are assigned to Core 1 when the option is enabled later.
 
-To run the portable NanoSLAM-Lite tests without hardware:
+## Onboard NanoSLAM and the laptop map
+
+While armed, the drone records a pose and a 400 ms ToF scan every 1.5 s (64 poses = 96 s),
+matches scans with ICP (consecutive scans and loop closures) and solves the pose graph with the
+ETH sparse least-squares solver every 5 poses. After disarming it runs a final optimisation and
+uploads the graph over Wi-Fi (UDP `CONFIG_NANOSLAM_UPLOAD_PORT`, default 5008). The laptop builds
+the map:
 
 ```bash
-cmake -S components/nanolite -B /tmp/nanolite-build
-cmake --build /tmp/nanolite-build
-ctest --test-dir /tmp/nanolite-build --output-on-failure
-python3 -m unittest -v laptop/test_nanolite_run_view.py
+python3 laptop/nanoslam_receive.py            # leave running, then land and disarm
 ```
 
-Bench firmware emits matching `NANOMAP` and `NANOGRAPH` snapshots. Render the
-latest complete pair from a recorded monitor log as a PNG:
+Each run is written to `results/slam/<profile>_run<N>_<date>_<time>/` (e.g.
+`8x8_15hz_run3_20261108_154646`), the same name as that flight's `results/experiments/` recording: `overview.png` (raw vs optimised
+trajectory, points, ICP constraints), `map/` (Nav2 `map.pgm` + `map.yaml`, optimised poses),
+`map-raw/` (same with PX4 odometry, for comparison), `slam_result.npz`, CSVs, and
+`packets.bin` (`--replay` rebuilds a run). To fly it, prepare a build with
+`scripts/prepare_experiment.py --stage <stage> --profile 8x8_15 --slam`.
+
+Host tests (no hardware):
 
 ```bash
-./laptop/nanolite_run_view.py run-logs/with-external-tof-power/<run>.log
+cmake -S components/nanoslam -B /tmp/nanoslam-build
+cmake --build /tmp/nanoslam-build
+ctest --test-dir /tmp/nanoslam-build --output-on-failure
+python3 -m pytest -q laptop/tests/test_nanoslam_receive.py
 ```
-
-The figure overlays the corrected key-pose trajectory on the occupancy map and
-shows the raw odometry reconstruction, optimized graph, scan poses, heading
-samples, and accepted loop-closure edges in a second panel. The output defaults
-to `<run>-nanolite.png` beside the input log. Matplotlib is required on the
-laptop; it is not part of the embedded firmware. Onboard projection aligns
-each muxed sensor return with an interpolated PX4 pose at that return's own
-timestamp instead of assigning the complete ring to the newest pose.
 
 ## Live ToF sensor heatmaps
 
@@ -223,7 +228,7 @@ the firmware is ready for flight.
 
 ## Review focus
 
-The most relevant project changes are the NanoSLAM-Lite integration in `main/nanolite_task.c`, ToF
-acquisition and recovery in `main/tof_task.c`, PX4 pose handling in `main/mavlink_task.c`, and the
-bounded SLAM implementation in `components/nanolite/`. See `UREX_INTEGRATION.md` for the current
+The most relevant project changes are the NanoSLAM bridge and upload in `main/slam_bridge.c`, ToF
+acquisition and recovery in `main/tof_task.c`, PX4 pose handling (including jump-free SLAM odometry)
+in `main/mavlink_task.c`, and the SLAM implementation in `components/nanoslam/`. See `UREX_INTEGRATION.md` for the current
 status and `experiments/README.md` for reproduction steps and interpretation guidance.

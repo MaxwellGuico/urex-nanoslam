@@ -43,8 +43,8 @@ experiment_status_t experiment_status(void)
 }
 bool experiment_submit(const experiment_request_t *r)
 {
-#if CONFIG_EXPERIMENT_MISSION_ENABLED && !CONFIG_NANOLITE_BENCH_MODE
-    if (!r->id || (r->mode!=1 && r->mode!=2) ||
+#if CONFIG_EXPERIMENT_MISSION_ENABLED && !CONFIG_BENCH_MODE
+    if (!r->id || (r->mode!=1 && r->mode!=2 && r->mode!=3) ||
         !isfinite(r->width)|| !isfinite(r->length)|| !isfinite(r->altitude)|| !isfinite(r->speed)||
         r->width<0.2f || r->width>10 || r->length<0.2f || r->length>10 ||
         r->altitude<0.3f || r->altitude>2 || r->speed<0.05f || r->speed>0.5f) return false;
@@ -143,7 +143,7 @@ void experiment_task(void *arg)
                 if (now-began>20000) { aborted=true; stage=EXP_LAND; began=now; last_action=0; phase(stage,corner); }
             }
             if (stage==EXP_DWELL) {
-                experiment_xy_t goal=experiment_corner(corner,request.length,request.width);
+                experiment_xy_t goal=experiment_waypoint(request.mode,corner,request.length,request.width);
                 mavlink_set_position_ned(home.x+goal.x,home.y+goal.y,target_z,home.heading);
                 float error=hypotf(d.x-home.x-goal.x,d.y-home.y-goal.y);
                 bool stable=experiment_settled(error,hypotf(d.vx,d.vy),0.1f) &&
@@ -152,14 +152,14 @@ void experiment_task(void *arg)
                 else if (!settled) settled=now;
                 if (settled && now-settled>=3000) {
                     settled=0;
-                    if (request.mode==EXPERIMENT_TAKEOFF_LAND || corner==4) {
+                    if (corner+1u>=experiment_waypoint_count(request.mode)) {
                         stage=EXP_LAND; last_action=0;
                     } else { ++corner; stage=EXP_LEG; }
                     began=now; phase(stage,corner);
                 } else if (now-began>30000) { aborted=true; stage=EXP_LAND; began=now; last_action=0; phase(stage,corner); }
             }
             if (stage==EXP_LEG) {
-                experiment_xy_t goal=experiment_corner(corner,request.length,request.width);
+                experiment_xy_t goal=experiment_waypoint(request.mode,corner,request.length,request.width);
                 // Bound setpoint lead if the aircraft lags; requested speed is a setpoint limit.
                 if (hypotf(command.x-(d.x-home.x),command.y-(d.y-home.y))<0.25f)
                     command=experiment_step(command,goal,request.speed,dt);

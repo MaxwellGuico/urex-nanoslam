@@ -160,8 +160,9 @@ static bool configure_sensor(uint8_t idx)
         ESP_LOGE(TAG,"[%d] profile readback mismatch",idx);
         return false;
     }
-    ESP_LOGI(TAG, "[%d] configured — %.0f° @ %dHz %dx%d, autonomous, integration=5ms",
-             idx, SENSOR_ANGLES[idx], TOF_RANGING_FREQ_HZ, TOF_NATIVE_SIDE, TOF_NATIVE_SIDE);
+    ESP_LOGI(TAG, "[%d] configured — %.0f° @ %dHz %dx%d, autonomous, integration=%lums",
+             idx, SENSOR_ANGLES[idx], TOF_RANGING_FREQ_HZ, TOF_NATIVE_SIDE, TOF_NATIVE_SIDE,
+             (unsigned long)TOF_INTEGRATION_MS);
     return true;
 }
 
@@ -397,40 +398,6 @@ tof_scan_t tof_get_scan(void)
     tof_scan_t copy = s_scan;
     xSemaphoreGive(s_scan_mutex);
     return copy;
-}
-
-uint8_t tof_get_mapping_returns(
-    uint16_t map_effective_range_mm,
-    nanolite_tof_return_t returns[TOF_SENSOR_COUNT])
-{
-    if (returns == NULL) return 0;
-    memset(returns,0,sizeof(*returns)*TOF_SENSOR_COUNT);
-    if (TOF_NATIVE_SIDE != 8) return 0;
-
-    nanolite_tof_config_t config = nanolite_default_tof_config();
-    config.map_effective_range_mm = map_effective_range_mm;
-    uint8_t valid_count = 0;
-
-    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
-    for (uint8_t sensor = 0; sensor < TOF_SENSOR_COUNT; ++sensor) {
-        memset(&returns[sensor], 0, sizeof(returns[sensor]));
-        returns[sensor].sensor_id = sensor;
-        if (!s_scan.sensor_ok[sensor] || !s_scan.frame[sensor].valid) {
-            continue;
-        }
-        const tof_frame_t *frame = &s_scan.frame[sensor];
-        if (nanolite_reduce_tof_frame(
-                frame->distance_mm,
-                frame->target_status,
-                sensor,
-                frame->timestamp_ms * 1000U,
-                &config,
-                &returns[sensor]) && returns[sensor].valid) {
-            ++valid_count;
-        }
-    }
-    xSemaphoreGive(s_scan_mutex);
-    return valid_count;
 }
 
 float tof_sensor_angle_deg(uint8_t sensor_id)
