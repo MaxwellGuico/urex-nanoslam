@@ -421,7 +421,11 @@ tof_health_t tof_get_health(uint32_t max_frame_age_ms)
             health.online_mask |= bit;
         }
         if (s_scan.sensor_ok[i] && s_scan.frame[i].valid) {
-            const uint32_t age_ms = now_ms - s_scan.frame[i].timestamp_ms;
+            /* now_ms was read before taking the mutex; the ToF task may have
+             * stamped a newer frame since. Count that as age 0, not as an
+             * unsigned wrap to ~49 days (which failed flight health). */
+            const int32_t signed_age = (int32_t)(now_ms - s_scan.frame[i].timestamp_ms);
+            const uint32_t age_ms = signed_age < 0 ? 0U : (uint32_t)signed_age;
             health.age_ms[i] = age_ms;
             if (age_ms <= max_frame_age_ms) {
                 health.fresh_mask |= bit;

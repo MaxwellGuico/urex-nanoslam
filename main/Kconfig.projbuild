@@ -283,7 +283,7 @@ menu "Drone Configuration"
         default n
         help
           Off (default): odometry edges come from the raw PX4 poses and edges
-          are weighted per axis (odometry 8 cm / 1 deg, ICP 3 cm / 3 deg), so
+          are weighted per axis (odometry 8 cm / 0.1 deg, ICP 3 cm / 3 deg), so
           PX4's precise gyro heading is not overridden by noisy ICP headings.
           On: ICP edges get 20x the information of odometry in every axis, as
           in ETH's code. Odometry edges still come from the raw poses.
@@ -302,7 +302,10 @@ menu "Drone Configuration"
         int "Times the whole upload is sent (UDP has no retransmission)"
         depends on NANOSLAM_ENABLED
         range 1 10
-        default 3
+        default 6
+        help
+          Each round takes about (nodes + 3) x 15 ms; 6 rounds of 64 nodes is about
+          6 s. Telemetry and ToF streaming pause during the upload.
 
     config NANOSLAM_SENSOR_OFFSET_MM
         int "ToF lens distance from the drone centre (mm)"

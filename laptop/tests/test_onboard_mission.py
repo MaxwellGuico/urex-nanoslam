@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[2]
 def test_onboard_mission_state_machine(tmp_path, without_tof, obstacle_abort):
     includes={
     'esp_timer.h':'#include <stdint.h>\nint64_t esp_timer_get_time(void);\n',
-    'esp_log.h':'#define ESP_LOGI(...) ((void)0)\n',
+    'esp_log.h':'#define ESP_LOGI(...) ((void)0)\n#define ESP_LOGW(...) ((void)0)\n',
     'tof_task.h':'#include <stdbool.h>\n#define TOF_NAV_MAX_FRAME_AGE_MS 250\nbool tof_all_sensors_fresh(unsigned);\nfloat tof_get_min_range_in_sector(float,float);\n',
     'wifi_task.h':'#include <stdbool.h>\nbool wifi_land_requested(void);\nvoid wifi_clear_land_request(void);\nvoid wifi_clear_start_request(void);\n',
     'freertos/FreeRTOS.h':'''#pragma once
@@ -76,6 +76,9 @@ void vTaskDelay(unsigned ms) {
  now_us+=ms*1000;
  assert(now_us<200000000);
  d.last_pos_ms=d.last_att_ms=d.last_hb_ms=now_us/1000;
+ /* Race: PX4 messages stamped by the MAVLink task 1 ms after the mission
+  * loop read its clock. Must count as fresh, not as ~49 days old. */
+ if(scenario==12) d.last_pos_ms=d.last_att_ms=d.last_hb_ms=now_us/1000+1;
  if(scenario==6 && status.phase==EXP_PRESTREAM) { d.armed=true; d.custom_main_mode=3; }
  if(scenario==7 && status.phase==EXP_ARM) d.custom_main_mode=3;
  if(scenario==2 && status.phase==EXP_LEG) d.custom_main_mode=3; // pilot takeover
@@ -106,8 +109,13 @@ void mavlink_send_land_command(void) {
 }
 void mavlink_set_position_ned(float x,float y,float z,float yaw) {
  d.x=x;d.y=y;d.z=z;d.heading=yaw;
- min_x=fminf(min_x,x);max_x=fmaxf(max_x,x);
- min_y=fminf(min_y,y);max_y=fmaxf(max_y,y);min_z=fminf(min_z,z);
+ /* Extents in the takeoff frame (forward/right of the nose at takeoff, home
+  * (10,-3), heading .4 rad): the rectangle must follow the drone's nose, not
+  * PX4's arbitrary north. */
+ float dx=x-10,dy=y+3,c=cosf(.4f),s=sinf(.4f);
+ float f=10+dx*c+dy*s,r=-3-dx*s+dy*c;
+ min_x=fminf(min_x,f);max_x=fmaxf(max_x,f);
+ min_y=fminf(min_y,r);max_y=fmaxf(max_y,r);min_z=fminf(min_z,z);
 }
 int main(int argc,char **argv) {
  assert(argc==2);scenario=atoi(argv[1]);
@@ -119,7 +127,7 @@ int main(int argc,char **argv) {
  if(!setjmp(finished)) experiment_task(NULL);
  experiment_status_t status=experiment_status();
  assert(!experiment_controls_enabled());
- if(scenario==0 || scenario==1 || (CONFIG_EXPERIMENT_WITHOUT_TOF && (scenario==4 || scenario==9))
+ if(scenario==0 || scenario==1 || scenario==12 || (CONFIG_EXPERIMENT_WITHOUT_TOF && (scenario==4 || scenario==9))
     || (!CONFIG_EXPERIMENT_OBSTACLE_ABORT && scenario==4)) {
    assert(status.phase==EXP_DONE && land_count>0 && arm_count>0 && mode_count>0);
    assert(fabsf(d.x-10)<.001f && fabsf(d.y+3)<.001f && fabsf(min_z-1.5)<.001f);
@@ -153,5 +161,5 @@ int main(int argc,char **argv) {
         f'-DCONFIG_EXPERIMENT_OBSTACLE_ABORT={int(obstacle_abort)}',
         '-I',str(tmp_path),'-I',str(ROOT/'main'),str(mission),str(simulator),
         str(ROOT/'main/experiment_plan.c'),'-lm','-o',str(binary)],check=True)
-    for scenario in range(12):
+    for scenario in range(13):
         subprocess.run([str(binary),str(scenario)],check=True)

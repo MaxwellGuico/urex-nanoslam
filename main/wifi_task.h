@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "vfh.h"
 
@@ -185,6 +186,11 @@ void wifi_task(void *arg);
 
 /* Returns true once the laptop has sent CMD_LAND. */
 bool wifi_land_requested(void);
+
+/* Pause telemetry and ToF-record streaming (commands are still received), so
+ * a burst such as the NanoSLAM upload gets the whole Wi-Fi link. ToF records
+ * queued while paused are discarded rather than sent late. */
+void wifi_set_streaming_paused(bool paused);
 
 /* Clear the land-request flag (call after acting on it). */
 void wifi_clear_land_request(void);

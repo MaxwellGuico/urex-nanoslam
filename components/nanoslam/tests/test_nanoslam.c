@@ -253,6 +253,48 @@ static void test_per_axis_weights_keep_good_heading(void) {
     assert(end_axis < 0.10f);   /* ICP still removes most of the 5% scale error (0.44 m) */
 }
 
+/* Final solve of 8x8_15hz_run16 (2026-11-08, 4 x 5.5 m room, 64 poses, 41
+ * sequential + 21 loop constraints) from PX4's raw poses. PX4's heading stayed
+ * within 0.6 deg over the flight; three early loop closures disagree with it by
+ * 4-8 deg. With 1 deg odometry yaw sigma the drone's solve rotated the graph by
+ * up to 3.8 deg. The default weights must keep every heading within 0.5 deg of
+ * PX4's. */
+static void test_run16_heading_follows_px4(void) {
+    static float raw[3 * MAX_POSES], x[3 * MAX_POSES];
+    static constraint cons[SLAM_MAX_CONSTRAINTS];
+    static measurement odo[MAX_POSES];
+    FILE *f = fopen(NANOSLAM_TEST_DATA "/flight-20261108-run16-raw-poses.txt", "r");
+    assert(f);
+    int n = 0;
+    while (n < MAX_POSES && fscanf(f, "%f %f %f", &raw[3 * n], &raw[3 * n + 1], &raw[3 * n + 2]) == 3) n++;
+    fclose(f);
+    f = fopen(NANOSLAM_TEST_DATA "/flight-20261108-run16-constraints.txt", "r");
+    assert(f);
+    int m = 0, from, to, kind;
+    float z0, z1, z2;
+    while (m < SLAM_MAX_CONSTRAINTS &&
+           fscanf(f, "%d %d %d %f %f %f", &from, &to, &kind, &z0, &z1, &z2) == 6) {
+        cons[m++] = (constraint){.fromIdx = (int16_t)from, .toIdx = (int16_t)to, .z = {z0, z1, z2}};
+    }
+    fclose(f);
+    assert(n == 64 && m == 62);
+    for (int i = 1; i < n; i++) measurement_from_poses(&raw[3 * (i - 1)], &raw[3 * i], odo[i - 1].z);
+    memcpy(x, raw, sizeof(float) * 3 * (size_t)n);
+    const ls_slam_weights_t w = SLAM_WEIGHTS_DEFAULT;
+    ls_slam_set_weights(&w);
+    assert(ls_slam_odometry(x, odo, NULL, cons, (int16_t)n, (int16_t)m));
+    float max_dyaw = 0, max_shift = 0;
+    for (int i = 0; i < n; i++) {
+        assert(isfinite(x[3 * i]) && isfinite(x[3 * i + 1]) && isfinite(x[3 * i + 2]));
+        max_dyaw = fmaxf(max_dyaw, fabsf(wrap(x[3 * i + 2] - raw[3 * i + 2])));
+        max_shift = fmaxf(max_shift, hypotf(x[3 * i] - raw[3 * i], x[3 * i + 1] - raw[3 * i + 1]));
+    }
+    printf("run16 final solve: max heading change %.2f deg, max position correction %.3f m\n",
+           max_dyaw * 180 / M_PI, max_shift);
+    assert(max_dyaw < DEG(0.5));
+    assert(max_shift > 0.05f);  /* ICP still corrects position */
+}
+
 /* --- scan ----------------------------------------------------------------- */
 
 static void test_reduce_frame_median_and_spread(void) {
@@ -279,6 +321,46 @@ static void test_reduce_frame_median_and_spread(void) {
     assert(out[3] == -1);
     assert(out[4] == 1000);
     assert(rejected == 2);
+}
+
+/* Beams with nothing within SCAN_MAX_VALID_MM ("no target", or a valid return
+ * beyond it) in at least SCAN_MIN_ROWS centre rows are marked
+ * SCAN_NO_TARGET, so the laptop can clear free space along them. ICP must
+ * still ignore them. */
+static void test_reduce_frame_no_target(void) {
+    int16_t dist[SCAN_ZONES];
+    uint8_t status[SCAN_ZONES];
+    for (int i = 0; i < SCAN_ZONES; i++) { dist[i] = 1000; status[i] = 5; }
+    for (int r = 2; r < 6; r++) {
+        status[r * 8 + 0] = 255;                       /* col 0: no target in all rows */
+        dist[r * 8 + 1] = 3200;                        /* col 1: wall beyond 2.5 m */
+        status[r * 8 + 2] = (r < 4) ? 255 : 4;         /* col 2: 2 no-target + 2 errors */
+        status[r * 8 + 3] = (r == 2) ? 255 : 4;        /* col 3: 1 no-target + 3 errors */
+    }
+    status[5 * 8 + 4] = 255;                           /* col 4: 3 valid hits + 1 no-target */
+    int16_t out[SCAN_NUM_COLS];
+    scan_set_columns(8);
+    scan_reduce_frame(dist, status, 8, out);
+    assert(out[0] == SCAN_NO_TARGET);
+    assert(out[1] == SCAN_NO_TARGET);
+    assert(out[2] == SCAN_NO_TARGET);
+    assert(out[3] == -1);
+    assert(out[4] == 1000);
+    assert(SCAN_NO_TARGET < 0 && SCAN_NO_TARGET != -1);
+
+    /* ICP points: only the 4 real hits (cols 4-7) survive */
+    float yaw[SCAN_NUM_DIRS] = {0};
+    scan_set_geometry(yaw, 0.0f);
+    static scan_t sc;
+    for (int f = 0; f < SCAN_NUM_FRAMES; f++)
+        for (int d = 0; d < SCAN_NUM_DIRS; d++) scan_invalidate_dists(sc.frames[f].dists[d]);
+    sc.frames[0].dx = sc.frames[0].dy = sc.frames[0].dyaw = 0;
+    memcpy(sc.frames[0].dists[0], out, sizeof(out));
+    icp_points_t *pts = points_alloc(POINTS_IN_SCAN);
+    scan_extract_points(&sc, 0, 0, 0, pts);
+    assert(pts->num == 4);
+    assert(scan_count_valid(&sc) == 4);
+    free(pts);
 }
 
 static void test_extract_points_geometry(void) {
@@ -438,7 +520,10 @@ static void synth_scan(const float pose[3], const float sensor_yaw[SCAN_NUM_DIRS
 }
 
 /* Fly a loop inside a room with drifting odometry, then optimise. */
-static void test_end_to_end_room_loop(slam_icp_method_t method, int columns) {
+/* offset_m shifts the odometry frame (PX4's local origin) away from the room,
+ * as on 2026-11-13 run 2, where accumulated reset offsets put every pose ~77 m
+ * from the origin and point-to-line ICP rejected all matches as unobservable. */
+static void test_end_to_end_room_loop_at(slam_icp_method_t method, int columns, float offset_m) {
     slam_set_icp_method(method);
     scan_set_columns(columns);
     float sensor_yaw[SCAN_NUM_DIRS];
@@ -464,19 +549,21 @@ static void test_end_to_end_room_loop(slam_icp_method_t method, int columns) {
     }
     truth[n][0] = way[4][0]; truth[n][1] = way[4][1]; truth[n][2] = DEG(10); n++;
 
-    /* Odometry: 0.4 deg yaw drift and 4% scale error per step */
+    /* Odometry: PX4-like 0.05 deg yaw drift and 4% scale error per step. The
+     * default weights trust odometry heading to 0.1 deg per step, so ICP's job
+     * here is the position (scale) error. */
     memcpy(odom[0], truth[0], sizeof(odom[0]));
     for (int i = 1; i < n; i++) {
         float z[3];
         measurement_from_poses(truth[i - 1], truth[i], z);
-        z[0] *= 1.04f; z[1] *= 1.04f; z[2] += DEG(0.4);
+        z[0] *= 1.04f; z[1] *= 1.04f; z[2] += DEG(0.05);
         compose(odom[i - 1], z, odom[i]);
     }
 
     static scan_t sc;
     for (int i = 0; i < n; i++) {
         synth_scan(truth[i], sensor_yaw, &sc);
-        slam_pose_t p = {odom[i][0], odom[i][1], odom[i][2]};
+        slam_pose_t p = {odom[i][0] + offset_m, odom[i][1] - 0.3f * offset_m, odom[i][2]};
         assert(slam_graph_add(&p, &p, &sc) == i);
     }
 
@@ -487,23 +574,33 @@ static void test_end_to_end_room_loop(slam_icp_method_t method, int columns) {
     slam_report_t rep;
     assert(slam_optimize(poses, &rep) == (size_t)n);
     assert(rep.solved);
-    for (int i = 0; i < n; i++) err_after += hypotf(poses[i][0] - truth[i][0], poses[i][1] - truth[i][1]);
+    for (int i = 0; i < n; i++) {
+        poses[i][0] -= offset_m;
+        poses[i][1] += 0.3f * offset_m;
+        err_after += hypotf(poses[i][0] - truth[i][0], poses[i][1] - truth[i][1]);
+    }
     err_before /= (float)n;
     err_after /= (float)n;
     float end_before = hypotf(odom[n - 1][0] - truth[n - 1][0], odom[n - 1][1] - truth[n - 1][1]);
     float end_after = hypotf(poses[n - 1][0] - truth[n - 1][0], poses[n - 1][1] - truth[n - 1][1]);
-    printf("room loop (%s, %dx%d): %d poses, seq %u/%u, loop %u/%u, mean error %.3f -> %.3f m, "
+    printf("room loop (%s, %dx%d, offset %.0f m): %d poses, seq %u/%u, loop %u/%u, mean error %.3f -> %.3f m, "
            "end error %.3f -> %.3f m\n",
            method == SLAM_ICP_POINT_TO_LINE ? "point-to-line" : "point-to-point",
-           columns, columns, n, rep.sequential_accepted, rep.sequential_attempts, rep.loop_accepted,
+           columns, columns, offset_m, n, rep.sequential_accepted, rep.sequential_attempts, rep.loop_accepted,
            rep.loop_attempts, err_before, err_after, end_before, end_after);
     assert(rep.sequential_accepted > 0);
+    assert(rep.sequential_accepted * 4 >= rep.sequential_attempts * 3);  /* >= 75% */
     assert(err_after < err_before);
 
+    for (int i = 0; i < n; i++) { poses[i][0] += offset_m; poses[i][1] -= 0.3f * offset_m; }
     slam_commit_poses(poses, (size_t)n);
     slam_pose_t back;
     assert(slam_graph_get_pose((size_t)n - 1, &back));
     assert(back.x == poses[n - 1][0]);
+}
+
+static void test_end_to_end_room_loop(slam_icp_method_t method, int columns) {
+    test_end_to_end_room_loop_at(method, columns, 0.0f);
 }
 
 /* In flight the drone optimises, commits and optimises again. With odometry
@@ -528,6 +625,7 @@ int main(void) {
     test_dense_loop_closures_always_fit();
     test_flight_20261108_final_solve();
     test_reduce_frame_median_and_spread();
+    test_reduce_frame_no_target();
     test_extract_points_geometry();
     test_icp_line_recovers_motion_on_walls();
     test_icp_line_rejects_single_wall();
@@ -539,6 +637,9 @@ int main(void) {
     test_weights_reproduce_eth();
     test_per_axis_weights_keep_good_heading();
     test_repeated_passes_do_not_compound();
+    test_run16_heading_follows_px4();
+    test_end_to_end_room_loop_at(SLAM_ICP_POINT_TO_LINE, 8, 80.0f);
+    test_end_to_end_room_loop_at(SLAM_ICP_POINT_TO_POINT, 8, 80.0f);
     printf("nanoslam tests passed; scan_t=%u B, sparseMatrix=%u B\n",
            (unsigned)sizeof(scan_t), (unsigned)sizeof(sparseMatrix));
     return 0;

@@ -35,6 +35,7 @@ _Static_assert(sizeof(wifi_tof_debug_pkt_t) == 203, "ToF debug wire layout chang
 static volatile bool s_land_requested  = false;
 static volatile bool s_start_requested = false;
 static volatile bool s_wifi_connected  = false;
+static volatile bool s_streaming_paused = false;
 
 static uint16_t telemetry_age_ms(uint32_t now_ms, uint32_t last_ms)
 {
@@ -376,6 +377,12 @@ void wifi_task(void *arg)
             }
         }
 
+        if (s_streaming_paused) {
+            tof_record_t discard;
+            while (tof_pop_record(&discard)) {}
+            vTaskDelayUntil(&last_wake,pdMS_TO_TICKS(5));
+            continue;
+        }
         send_tof_records(tof_sock);
         const int64_t tick_us=esp_timer_get_time();
         if (tick_us-last_telem_us < 1000000/CONFIG_DATA_TELEM_HZ) {
@@ -482,6 +489,11 @@ void wifi_task(void *arg)
 #endif
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1));
     }
+}
+
+void wifi_set_streaming_paused(bool paused)
+{
+    s_streaming_paused = paused;
 }
 
 bool wifi_land_requested(void)

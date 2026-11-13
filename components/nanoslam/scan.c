@@ -100,7 +100,7 @@ int scan_reduce_frame(const int16_t distance_mm[SCAN_ZONES],
     scan_invalidate_dists(measurements);
     for (int col = 0; col < side; col++) {
         int16_t rows[4];
-        uint8_t num_rows = 0;
+        uint8_t num_rows = 0, num_beyond = 0;
         /* Centre rows (~+-11 deg about horizontal): rows 2-5 of 8x8 as in the
          * ETH original, rows 1-2 of 4x4. The outer rows hit the floor/ceiling
          * at cruise altitude and produced rings of fake obstacles. */
@@ -112,11 +112,17 @@ int scan_reduce_frame(const int16_t distance_mm[SCAN_ZONES],
             if ((status == 5 || status == 9) && dist >= SCAN_MIN_VALID_MM &&
                 dist <= SCAN_MAX_VALID_MM) {
                 rows[num_rows++] = dist;
+            } else if (status == 255 ||
+                       ((status == 5 || status == 9) && dist > SCAN_MAX_VALID_MM)) {
+                /* 255 = no target detected */
+                num_beyond++;
             }
         }
 
         if (num_rows == 0) {
-            measurements[col] = -1;
+            /* Nothing within range in enough rows: free space for the map,
+             * ignored by ICP (below SCAN_MIN_VALID_MM) */
+            measurements[col] = (num_beyond >= SCAN_MIN_ROWS) ? SCAN_NO_TARGET : -1;
             continue;
         }
 

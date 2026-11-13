@@ -65,6 +65,8 @@ int main(int argc, char **argv) {
                 for (int c = 0; c < 8; c++) n.frames[fr].dists[d][c] = -1;
         float range = (3.0f - n.optimised[0]) / cosf(ang);
         for (int fr = 0; fr < 5; fr++) n.frames[fr].dists[0][col] = (short)lrintf(range * 1000.0f);
+        /* Tail sensor (facing south) sees nothing within range */
+        for (int fr = 0; fr < 5; fr++) n.frames[fr].dists[4][col] = SCAN_NO_TARGET;
         put(f, &n, sizeof n);
     }
     for (int k = 0; k < chunks; k++) {
@@ -139,6 +141,25 @@ def test_upload_round_trip_builds_map(packets, tmp_path):
     assert (run_dir / 'map' / 'map.pgm').exists()
     assert (run_dir / 'map-raw' / 'map.yaml').exists()
 
+    # Rule D: no-target beams are kept (body frame, 2.5 m) and clear free space
+    with np.load(run_dir / 'slam_result.npz') as result:
+        clear = result['clear_points']
+        clear_ids = result['clear_scan_ids']
+        assert result['clear_origins'].shape == clear.shape
+    assert len(clear) == 4 * 5 and len(clear_ids) == len(clear)
+    assert np.allclose(np.hypot(clear[:, 0], clear[:, 1]), 2.5, atol=1e-3)
+    assert np.all(clear[:, 0] < -2.4)                          # behind the drone (FLU x < 0)
+    with np.load(run_dir / 'map' / 'occupancy.npz') as occ:
+        o, res = occ['origin'], float(occ['resolution'])
+        # North 0.0 is 0.8-1.7 m behind every node, so all 4 scans clear it;
+        # column 3 is 2.8 deg off the tail axis, so allow +-0.15 m east
+        row = int(np.floor((0.0 - o[1]) / res))
+        cols = slice(int(np.floor((0.85 - o[0]) / res)), int(np.floor((1.15 - o[0]) / res)) + 1)
+        assert np.any(occ['observed'][row, cols] & (occ['probability'][row, cols] < .196))
+    map_summary = json.loads((run_dir / 'map' / 'summary.json').read_text())
+    assert map_summary['source']['free_space'].startswith('rule D')
+    assert (run_dir / 'map_overview.png').exists()
+
 
 def test_4x4_upload_projects_columns(tmp_path):
     out = build_packets(tmp_path, columns=4)
@@ -188,3 +209,17 @@ def test_missing_node_still_builds_partial_map(packets, tmp_path):
 def test_rejects_unknown_version():
     pkt = struct.pack('<BBBBIHH', rx.PKT_END, 99, 8, 0, 1, 0, 1) + struct.pack('<HH', 0, 0)
     assert rx.parse_packet(pkt) is None
+
+
+def test_rebuild_in_place_regenerates_outputs(packets, tmp_path):
+    collector = rx.Collector(tmp_path / 'runs', resolution=.05, preview=False, idle_s=1., experiments_root=tmp_path / 'exp')
+    rx.replay(packets, collector)
+    run_dir = collector.written[0]
+    log = (run_dir / 'receive.log').read_text()
+    (run_dir / 'map_overview.png').unlink()
+    (run_dir / 'map' / 'map.pgm').write_bytes(b'stale')
+    assert rx.main(['--rebuild', str(run_dir), '--no-preview']) == 0
+    assert (run_dir / 'map_overview.png').exists()
+    assert (run_dir / 'map' / 'map.pgm').read_bytes().startswith(b'P5')
+    assert (run_dir / 'receive.log').read_text() == log
+    assert sorted(p.name for p in (tmp_path / 'runs').iterdir()) == [run_dir.name]   # no new folder

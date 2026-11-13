@@ -57,6 +57,8 @@ RAM_FIELDS = ('internal_total', 'internal_free_start', 'internal_free_min', 'int
 
 NUM_FRAMES, NUM_DIRS, NUM_COLS = 5, 8, 8
 MIN_VALID_MM, MAX_VALID_MM = 300, 2500           # SCAN_MIN/MAX_VALID_MM
+SCAN_NO_TARGET = -2                               # scan.h: nothing within MAX_VALID_MM
+CLEAR_RANGE_M = MAX_VALID_MM / 1000.0             # free-space length of a no-target beam
 
 assert HDR.size + SUMMARY.size == 132
 assert HDR.size + SUMMARY.size + SUMMARY_V2_EXTRA.size == 136
@@ -169,9 +171,10 @@ def ned_to_enu_pose(p):
     return np.array([p[1], p[0], math.atan2(math.sin(math.pi / 2 - p[2]), math.cos(math.pi / 2 - p[2]))])
 
 
-def node_rays(node: dict, yaw_table, offset_m, columns=8):
-    """Endpoints and sensor origins in the node's body frame, FLU (x forward,
-    y left), metres. Mirrors scan_extract_points() in components/nanoslam."""
+def _node_beams(node: dict, yaw_table, offset_m, columns, beam_range):
+    """Beam endpoints and sensor origins in the node's body frame, FLU (x
+    forward, y left), metres, for every column where beam_range(mm) returns a
+    range. Mirrors scan_extract_points() in components/nanoslam."""
     x, y, yaw = node['optimised']
     c0, s0 = math.cos(-yaw), math.sin(-yaw)
     points, origins = [], []
@@ -183,11 +186,10 @@ def node_rays(node: dict, yaw_table, offset_m, columns=8):
             ox, oy = fx + offset_m * cd, fy + offset_m * sd
             step = -(math.pi / 4) / columns  # column 0 is the most clockwise
             for col in range(columns):
-                mm = int(frame['dists'][d, col])
-                if mm < MIN_VALID_MM or mm > MAX_VALID_MM:
+                r = beam_range(int(frame['dists'][d, col]))
+                if r is None:
                     continue
                 a = -(columns // 2) * step + step / 2 + col * step
-                r = mm / 1000.0
                 px = fx + (r * math.cos(a) + offset_m) * cd - (r * math.sin(a)) * sd
                 py = fy + (r * math.cos(a) + offset_m) * sd + (r * math.sin(a)) * cd
                 for world, out in (((px, py), points), ((ox, oy), origins)):
@@ -195,6 +197,19 @@ def node_rays(node: dict, yaw_table, offset_m, columns=8):
                     fwd, right = c0 * dn - s0 * de, s0 * dn + c0 * de
                     out.append((fwd, -right))
     return np.asarray(points, dtype=float).reshape(-1, 2), np.asarray(origins, dtype=float).reshape(-1, 2)
+
+
+def node_rays(node: dict, yaw_table, offset_m, columns=8):
+    """Hit beams (a return within MIN..MAX_VALID_MM), body frame."""
+    return _node_beams(node, yaw_table, offset_m, columns,
+                       lambda mm: mm / 1000.0 if MIN_VALID_MM <= mm <= MAX_VALID_MM else None)
+
+
+def node_clear_rays(node: dict, yaw_table, offset_m, columns=8):
+    """No-target beams (SCAN_NO_TARGET: nothing within MAX_VALID_MM), ending at
+    CLEAR_RANGE_M, body frame. The map clears free space along them (rule D)."""
+    return _node_beams(node, yaw_table, offset_m, columns,
+                       lambda mm: CLEAR_RANGE_M if mm == SCAN_NO_TARGET else None)
 
 
 # --- outputs ------------------------------------------------------------------
@@ -221,32 +236,40 @@ def ram_report(ram: dict) -> str:
 
 
 def write_run(run: Run, out_root: Path, *, resolution: float, preview: bool,
-              experiments_root: Path = Path('results/experiments')) -> Path:
+              experiments_root: Path = Path('results/experiments'), out_dir: Path | None = None) -> Path:
     s = run.summary
-    # Same name as this flight's experiment recording (<profile>_run<N>_<date>_<time>)
-    name = name_for_upload(profile_label(columns=s['columns'], hz=s['tof_hz']), datetime.now(),
-                           experiments_root, out_root)
-    out = out_root / name
-    for k in range(2, 100):
-        if not out.exists():
-            break
-        out = out_root / f'{name}_upload{k}'
-    out.mkdir(parents=True, exist_ok=False)
+    if out_dir is not None:          # rebuild in place; packets.bin is already there
+        out = Path(out_dir)
+    else:
+        # Same name as this flight's experiment recording (<profile>_run<N>_<date>_<time>)
+        name = name_for_upload(profile_label(columns=s['columns'], hz=s['tof_hz']), datetime.now(),
+                               experiments_root, out_root)
+        out = out_root / name
+        for k in range(2, 100):
+            if not out.exists():
+                break
+            out = out_root / f'{name}_upload{k}'
+        out.mkdir(parents=True, exist_ok=False)
 
-    with (out / 'packets.bin').open('xb') as handle:
-        for data in run.packets:
-            handle.write(struct.pack('<H', len(data)) + data)
+        with (out / 'packets.bin').open('xb') as handle:
+            for data in run.packets:
+                handle.write(struct.pack('<H', len(data)) + data)
 
     ids = sorted(run.nodes)
     raw = np.array([ned_to_enu_pose(run.nodes[i]['raw']) for i in ids])
     opt = np.array([ned_to_enu_pose(run.nodes[i]['optimised']) for i in ids])
     points, origins, scan_ids = [], [], []
+    clear_points, clear_origins, clear_ids = [], [], []
     for k, i in enumerate(ids):
         p, o = node_rays(run.nodes[i], s['sensor_yaw_rad'], s['sensor_offset_m'], s['columns'])
         points.append(p); origins.append(o); scan_ids.append(np.full(len(p), k, dtype=np.int64))
-    points = np.vstack(points) if points else np.zeros((0, 2))
-    origins = np.vstack(origins) if origins else np.zeros((0, 2))
+        p, o = node_clear_rays(run.nodes[i], s['sensor_yaw_rad'], s['sensor_offset_m'], s['columns'])
+        clear_points.append(p); clear_origins.append(o); clear_ids.append(np.full(len(p), k, dtype=np.int64))
+    stack = lambda a: np.vstack(a) if a else np.zeros((0, 2))
+    points, origins = stack(points), stack(origins)
+    clear_points, clear_origins = stack(clear_points), stack(clear_origins)
     scan_ids = np.concatenate(scan_ids) if scan_ids else np.zeros(0, dtype=np.int64)
+    clear_ids = np.concatenate(clear_ids) if clear_ids else np.zeros(0, dtype=np.int64)
     edges = dict(odometry=max(len(ids) - 1, 0),
                  sequential_icp=sum(c['kind'] == 'seq' for c in run.available_constraints()),
                  loop=sum(c['kind'] == 'loop' for c in run.available_constraints()))
@@ -260,6 +283,7 @@ def write_run(run: Run, out_root: Path, *, resolution: float, preview: bool,
     np.savez_compressed(out / 'slam_result.npz', schema_version=np.array(1),
                         points=points, origins=origins, scan_ids=scan_ids,
                         raw_poses=raw, optimized_poses=opt,
+                        clear_points=clear_points, clear_origins=clear_origins, clear_scan_ids=clear_ids,
                         timestamps_us=np.array([i * s['record_interval_ms'] * 1000 for i in ids]),
                         metadata_json=np.array(json.dumps(metadata)))
     (out / 'summary.json').write_text(json.dumps(metadata, indent=2) + '\n')
@@ -279,9 +303,51 @@ def write_run(run: Run, out_root: Path, *, resolution: float, preview: bool,
                                       *extra])
     try:
         draw_overview(out, raw, opt, points, scan_ids, run.available_constraints(), ids)
+        if len(points):
+            draw_map_overview(out, raw, opt, points, origins, scan_ids, clear_points, clear_origins,
+                              clear_ids, resolution)
     except ImportError:
-        print('matplotlib not installed; skipped overview.png')
+        print('matplotlib not installed; skipped overview.png and map_overview.png')
     return out
+
+
+def draw_map_overview(out, raw, opt, points, origins, scan_ids, clear_points, clear_origins, clear_ids,
+                      resolution):
+    """map_overview.png: PX4 poses (rule A) | SLAM poses (rule A) | SLAM poses (rule D),
+    each with the flight path and free / wall / unknown cell counts."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    panels = ((raw, True, 'PX4 poses, hits only (rule A)'),
+              (opt, True, 'SLAM poses, hits only (rule A)'),
+              (opt, False, 'SLAM poses, free space to 2.5 m (rule D)'))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 7.5), sharex=True, sharey=True)
+    for ax, (poses, hits_only, title) in zip(axes, panels):
+        log_odds, observed, origin = make_occupancy_grid.rasterize(
+            points, origins, scan_ids, poses, resolution,
+            clear_points=clear_points, clear_origins=clear_origins, clear_scan_ids=clear_ids,
+            hits_only=hits_only)
+        probability = 1 / (1 + np.exp(-log_odds))
+        image = np.full(log_odds.shape, 205, dtype=np.uint8)
+        image[observed & (probability < .196)] = 254
+        image[observed & (probability > .65)] = 0
+        h, w = image.shape
+        ax.imshow(image, origin='lower', cmap='gray', vmin=0, vmax=255,
+                  extent=[origin[0], origin[0] + w * resolution, origin[1], origin[1] + h * resolution])
+        ax.plot(poses[:, 0], poses[:, 1], '-', color='#3b7dd8', lw=1)
+        ax.plot(poses[0, 0], poses[0, 1], 's', color='#2e9e5b', ms=6)
+        counts = {k: int(np.count_nonzero(image == v)) for k, v in (('free', 254), ('wall', 0), ('unknown', 205))}
+        ax.set_title(f"{title}\nfree {counts['free']}  wall {counts['wall']}  unknown {counts['unknown']}",
+                     fontsize=10)
+        ax.set_xlabel('East (m)')
+        ax.set_aspect('equal')
+        ax.set_facecolor((205 / 255,) * 3)   # outside the grid reads as unknown
+    axes[0].set_ylabel('North (m)')
+    heading = math.degrees(math.atan2(math.cos(raw[0, 2]), math.sin(raw[0, 2])))  # ENU yaw -> NED heading
+    fig.suptitle(f'{out.name}: {len(raw)} poses, PX4 heading at takeoff {heading:+.1f} deg')
+    fig.tight_layout(rect=(0, 0, 1, 0.95))   # leave room for the suptitle
+    fig.savefig(out / 'map_overview.png', dpi=100)
+    plt.close(fig)
 
 
 def draw_overview(out, raw, opt, points, scan_ids, constraints, ids):
@@ -385,6 +451,44 @@ def replay(path: Path, collector: Collector) -> None:
             collector.finish(key, partial=True)
 
 
+GENERATED = ('slam_result.npz', 'summary.json', 'trajectory.csv', 'constraints.csv',
+             'overview.png', 'map_overview.png', 'map', 'map-raw')
+
+
+def load_run(packets_path: Path) -> Run:
+    """Parse a saved packets.bin into a Run (complete or partial)."""
+    runs = {}
+    collector = Collector(Path('.'), .05, False, 0.)
+    collector.finish = lambda key, *, partial: runs.setdefault('run', collector.runs.pop(key))
+    data = Path(packets_path).read_bytes()
+    off = 0
+    while off + 2 <= len(data):
+        (n,) = struct.unpack_from('<H', data, off)
+        collector.feed(data[off + 2: off + 2 + n])
+        off += 2 + n
+    for key in list(collector.runs):
+        if collector.runs[key].summary:
+            collector.finish(key, partial=True)
+    if 'run' not in runs:
+        raise ValueError(f'No complete NanoSLAM run in {packets_path}')
+    return runs['run']
+
+
+def rebuild_run(run_dir: Path, *, resolution: float = .05, preview: bool = True) -> Path:
+    """Regenerate a run's maps and files in place from its packets.bin, with
+    the current map rules. packets.bin and receive.log are kept."""
+    import shutil
+    run_dir = Path(run_dir)
+    run = load_run(run_dir / 'packets.bin')
+    for name in GENERATED:
+        target = run_dir / name
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+    return write_run(run, run_dir.parent, resolution=resolution, preview=preview, out_dir=run_dir)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port', type=int, default=5008, help='CONFIG_NANOSLAM_UPLOAD_PORT (default 5008)')
@@ -397,7 +501,14 @@ def main(argv=None) -> int:
     ap.add_argument('--idle', type=float, default=5., help='Seconds after the last packet before '
                     'building an incomplete run')
     ap.add_argument('--replay', type=Path, help='Rebuild from a saved packets.bin instead of listening')
+    ap.add_argument('--rebuild', type=Path, nargs='+', metavar='RUN_DIR',
+                    help='Regenerate existing run folders in place from their packets.bin '
+                         '(maps, overview images, npz); keeps packets.bin and receive.log')
     args = ap.parse_args(argv)
+    if args.rebuild:
+        for run_dir in args.rebuild:
+            print(f'Rebuilt {rebuild_run(run_dir, resolution=args.resolution, preview=not args.no_preview)}')
+        return 0
     collector = Collector(args.output, args.resolution, not args.no_preview, args.idle, args.experiments)
 
     if args.replay:

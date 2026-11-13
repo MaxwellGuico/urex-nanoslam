@@ -108,6 +108,40 @@ def test_raycast_keeps_unseen_cells_unknown_and_endpoint_occupied():
         rasterize(points, np.zeros_like(points), np.arange(5), np.zeros((5, 3)), max_cells=1)
 
 
+def test_clear_beams_mark_free_space_and_stop_at_walls():
+    """Rule D: beams with nothing in range clear free space along their length,
+    but stop before walls seen by hit beams, so walls are never erased and no
+    free space leaks through them."""
+    n = 5
+    wall_y = np.linspace(-.5, .5, 11)
+    points = np.vstack([np.column_stack([np.ones_like(wall_y), wall_y])] * n)   # wall at x = 1
+    scan_ids = np.repeat(np.arange(n), len(wall_y))
+    poses = np.zeros((n, 3))
+    clear = np.tile([[-2.5, 0.], [2.5, 0.]], (n, 1))      # one away from the wall, one through it
+    clear_ids = np.repeat(np.arange(n), 2)
+    kwargs = dict(resolution=.1, margin=.2)
+    odds_a, seen_a, origin = rasterize(points, np.zeros_like(points), scan_ids, poses,
+                                       clear_points=clear, clear_origins=np.zeros_like(clear),
+                                       clear_scan_ids=clear_ids, hits_only=True, **kwargs)
+    odds_d, seen_d, origin_d = rasterize(points, np.zeros_like(points), scan_ids, poses,
+                                         clear_points=clear, clear_origins=np.zeros_like(clear),
+                                         clear_scan_ids=clear_ids, **kwargs)
+    def cell(x, y, o):
+        c = np.floor((np.array([x, y]) - o) / .1).astype(int)
+        return (c[1], c[0])
+    def at(grid, x, y, o):   # outside the grid counts as unseen
+        r, c = cell(x, y, o)
+        return grid[r, c] if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] else False
+    assert not at(seen_a, -2., 0., origin)                     # rule A: no evidence there
+    assert seen_d[cell(-2., 0., origin_d)] and odds_d[cell(-2., 0., origin_d)] < -1.5  # rule D: free
+    assert odds_d[cell(1., 0., origin_d)] > 4
+    assert np.isclose(odds_d[cell(1., 0., origin_d)], odds_a[cell(1., 0., origin)])
+    assert not at(seen_d, 2., 0., origin_d)                    # nothing cleared behind the wall
+    # Without clear beams the result is exactly rule A
+    odds_none, seen_none, _ = rasterize(points, np.zeros_like(points), scan_ids, poses, **kwargs)
+    assert np.array_equal(seen_none, seen_a) and np.allclose(odds_none, odds_a)
+
+
 @pytest.mark.parametrize('change', ['drone', 'esp_boot', 'px4_reset'])
 def test_recording_rejects_mixed_drones_or_resets(tmp_path, change):
     rows = [dict(drone_id='0', boot_id='42', esp_send_us=1000, px4_pos_boot_ms=1000),

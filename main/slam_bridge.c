@@ -33,6 +33,7 @@
 #include "slam_graph.h"
 #include "slam_upload.h"
 #include "tof_task.h"
+#include "wifi_task.h"
 
 static const char *TAG = "slam_bridge";
 
@@ -378,13 +379,17 @@ static void fill_header(slam_upload_header_t *h, uint8_t type, uint16_t index, u
     h->total = total;
 }
 
+/* Gap between upload datagrams. 4 ms lost 65-75% of packets per round over a
+ * phone hotspot on 2026-11-13 (run 9: 23 of 63 nodes never arrived). */
+#define SLAM_UPLOAD_GAP_MS 15
+
 static void send_packet(int sock, const void *data, size_t len) {
     /* Pace the burst so the Wi-Fi TX queue does not drop datagrams */
     for (int attempt = 0; attempt < 5; attempt++) {
         if (send(sock, data, len, 0) >= 0) break;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    vTaskDelay(pdMS_TO_TICKS(4));
+    vTaskDelay(pdMS_TO_TICKS(SLAM_UPLOAD_GAP_MS));
 }
 
 static void upload_result(void) {
@@ -403,6 +408,8 @@ static void upload_result(void) {
     };
     inet_aton(CONFIG_HOST_IPV4_ADDR, &dest.sin_addr);
     connect(sock, (struct sockaddr *)&dest, sizeof(dest));
+    /* Give the upload the whole link: no telemetry or ToF streaming meanwhile */
+    wifi_set_streaming_paused(true);
 
     const size_t n = slam_graph_pose_count();
     const constraint *cons = NULL;
@@ -497,6 +504,7 @@ static void upload_result(void) {
         vTaskDelay(pdMS_TO_TICKS(200));
     }
     close(sock);
+    wifi_set_streaming_paused(false);
     ESP_LOGI(TAG, "SLAM run %lu uploaded to %s:%d (%u nodes, %u constraints, x%d)",
              (unsigned long)s_run_id, CONFIG_HOST_IPV4_ADDR, CONFIG_NANOSLAM_UPLOAD_PORT,
              (unsigned)n, (unsigned)nc, CONFIG_NANOSLAM_UPLOAD_REPEATS);

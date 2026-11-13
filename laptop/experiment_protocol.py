@@ -69,8 +69,9 @@ def decode_native(data: bytes) -> NativeFrame | None:
 MODE_CODES={'takeoff-land':1,'rectangle':2,'rectangle-centred':3}
 
 def mission_waypoints(mode: str, width=1., length=1.):
-    """(north, east) waypoints relative to takeoff, as experiment_waypoint()
-    in main/experiment_plan.c flies them. First = takeoff, last = landing."""
+    """(forward, right) waypoints relative to the drone's nose at takeoff, as
+    experiment_waypoint() in main/experiment_plan.c defines them; the firmware
+    rotates them by PX4's takeoff heading. First = takeoff, last = landing."""
     if mode=='rectangle':
         return [(0,0),(length,0),(length,width),(0,width),(0,0)]
     if mode=='rectangle-centred':

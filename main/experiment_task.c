@@ -56,18 +56,28 @@ bool experiment_submit(const experiment_request_t *r)
     (void)r; return false;
 #endif
 }
-static bool healthy(drone_state_t d, uint32_t now)
+/* t was stamped within limit_ms of now. Other tasks stamp messages with their
+ * own clock reads, so t can be a little newer than now: a signed difference
+ * counts that as fresh (unsigned now-t wrapped to ~49 days and landed the
+ * drone mid-leg on 2026-11-13). */
+static bool recent(uint32_t now, uint32_t t, uint32_t limit_ms)
 {
-    return isfinite(d.x) && isfinite(d.y) && isfinite(d.z) && isfinite(d.heading) &&
-        isfinite(d.vx) && isfinite(d.vy) && isfinite(d.vz) &&
-        d.last_pos_ms && now-d.last_pos_ms<250 && d.last_att_ms &&
-        now-d.last_att_ms<250 && d.last_hb_ms && now-d.last_hb_ms<1500 &&
-        mavlink_clock_status().locked
-#if !CONFIG_EXPERIMENT_WITHOUT_TOF
-        && tof_all_sensors_fresh(TOF_NAV_MAX_FRAME_AGE_MS)
-#endif
-        ;
+    return t != 0 && (int32_t)(now - t) < (int32_t)limit_ms;
 }
+static const char *health_fault(drone_state_t d, uint32_t now)
+{
+    if (!(isfinite(d.x) && isfinite(d.y) && isfinite(d.z) && isfinite(d.heading) &&
+          isfinite(d.vx) && isfinite(d.vy) && isfinite(d.vz))) return "non-finite PX4 state";
+    if (!recent(now, d.last_pos_ms, 250)) return "PX4 position stale";
+    if (!recent(now, d.last_att_ms, 250)) return "PX4 attitude stale";
+    if (!recent(now, d.last_hb_ms, 1500)) return "PX4 heartbeat lost";
+    if (!mavlink_clock_status().locked) return "clock sync lost";
+#if !CONFIG_EXPERIMENT_WITHOUT_TOF
+    if (!tof_all_sensors_fresh(TOF_NAV_MAX_FRAME_AGE_MS)) return "ToF sensor stale";
+#endif
+    return NULL;
+}
+static bool healthy(drone_state_t d, uint32_t now) { return health_fault(d, now) == NULL; }
 void experiment_task(void *arg)
 {
     (void)arg;
@@ -99,14 +109,16 @@ void experiment_task(void *arg)
                 controls(false); phase(EXP_PILOT_TAKEOVER,corner); break;
             }
             // An explicit pilot mode change ends ownership; never switch back to offboard.
-            if (was_armed && d.last_hb_ms && now-d.last_hb_ms<1500 &&
+            if (was_armed && recent(now, d.last_hb_ms, 1500) &&
                 d.armed && d.custom_main_mode!=PX4_MAIN_MODE_OFFBOARD && stage!=EXP_LAND) {
                 controls(false); phase(EXP_PILOT_TAKEOVER,corner); break;
             }
             if (was_armed && !d.armed && stage!=EXP_LAND) {
                 controls(false); phase(EXP_ABORT,corner); break;
             }
-            if (stage!=EXP_LAND && (wifi_land_requested() || !healthy(d,now))) {
+            const char *fault = stage!=EXP_LAND ? health_fault(d,now) : NULL;
+            if (stage!=EXP_LAND && (wifi_land_requested() || fault)) {
+                ESP_LOGW("experiment", "Landing: %s", fault ? fault : "land requested over Wi-Fi");
                 aborted=true;
                 if (!d.armed) { controls(false); phase(EXP_ABORT,corner); break; }
                 stage=EXP_LAND; began=now; last_action=0; phase(stage,corner);
@@ -143,7 +155,8 @@ void experiment_task(void *arg)
                 if (now-began>20000) { aborted=true; stage=EXP_LAND; began=now; last_action=0; phase(stage,corner); }
             }
             if (stage==EXP_DWELL) {
-                experiment_xy_t goal=experiment_waypoint(request.mode,corner,request.length,request.width);
+                experiment_xy_t goal=experiment_rotate(
+                    experiment_waypoint(request.mode,corner,request.length,request.width),home.heading);
                 mavlink_set_position_ned(home.x+goal.x,home.y+goal.y,target_z,home.heading);
                 float error=hypotf(d.x-home.x-goal.x,d.y-home.y-goal.y);
                 bool stable=experiment_settled(error,hypotf(d.vx,d.vy),0.1f) &&
@@ -159,7 +172,8 @@ void experiment_task(void *arg)
                 } else if (now-began>30000) { aborted=true; stage=EXP_LAND; began=now; last_action=0; phase(stage,corner); }
             }
             if (stage==EXP_LEG) {
-                experiment_xy_t goal=experiment_waypoint(request.mode,corner,request.length,request.width);
+                experiment_xy_t goal=experiment_rotate(
+                    experiment_waypoint(request.mode,corner,request.length,request.width),home.heading);
                 // Bound setpoint lead if the aircraft lags; requested speed is a setpoint limit.
                 if (hypotf(command.x-(d.x-home.x),command.y-(d.y-home.y))<0.25f)
                     command=experiment_step(command,goal,request.speed,dt);

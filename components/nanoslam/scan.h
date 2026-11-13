@@ -43,9 +43,13 @@ _Static_assert(POINTS_IN_SCAN <= ICP_MAX_POINTS, "icp() buffers must hold a full
  * rejects mixed pixels where a beam straddles an edge */
 #define SCAN_MIN_ROWS 2
 #define SCAN_MAX_ROW_SPREAD_MM 100
+/* Column value when at least SCAN_MIN_ROWS centre rows saw nothing within
+ * SCAN_MAX_VALID_MM (status 255 "no target", or a valid return beyond it) and
+ * none saw a hit. The laptop map clears free space along it; ICP skips it. */
+#define SCAN_NO_TARGET (-2)
 
 typedef struct {
-    int16_t dists[SCAN_NUM_DIRS][SCAN_NUM_COLS]; /* mm, -1 = no measurement */
+    int16_t dists[SCAN_NUM_DIRS][SCAN_NUM_COLS]; /* mm; -1 = no measurement, SCAN_NO_TARGET = nothing in range */
     float dx, dy, dyaw; /* drone motion since the scan's first frame */
 } scan_frame_t;
 

@@ -31,8 +31,11 @@ typedef enum {
 void slam_set_icp_method(slam_icp_method_t method);
 
 /* Edge weights: per-axis sigmas for odometry (from the raw odometry poses)
- * and ICP constraints. SLAM_WEIGHTS_ETH reproduces ETH/Duncan's weighting. */
-#define SLAM_WEIGHTS_DEFAULT {.odom_sigma_xy = 0.08f, .odom_sigma_yaw = 0.01745f, \
+ * and ICP constraints. Odometry yaw is 0.1 deg per edge (PX4's gyro heading
+ * drifts <= 0.03 deg/s, i.e. ~0.06 deg per 2 s edge), so the heading follows
+ * PX4 and ICP corrects position only. SLAM_WEIGHTS_ETH reproduces ETH's
+ * weighting. */
+#define SLAM_WEIGHTS_DEFAULT {.odom_sigma_xy = 0.08f, .odom_sigma_yaw = 0.001745f, \
                               .icp_sigma_xy = 0.03f, .icp_sigma_yaw = 0.05236f}
 #define SLAM_WEIGHTS_ETH     {.odom_sigma_xy = 1.0f, .odom_sigma_yaw = 1.0f, \
                               .icp_sigma_xy = 0.2236068f, .icp_sigma_yaw = 0.2236068f}

@@ -40,10 +40,38 @@ def line_cells(start, end):
             y += sy
 
 
+def _dilate(mask):
+    """3x3 binary dilation."""
+    padded = np.pad(mask, 1)
+    out = np.zeros_like(mask)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            out |= padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+    return out
+
+
 def rasterize(points, origins, scan_ids, poses, resolution=.05, margin=.5,
-              hit=.85, miss=-.4, max_cells=4_000_000):
+              hit=.85, miss=-.4, max_cells=4_000_000, *,
+              clear_points=None, clear_origins=None, clear_scan_ids=None, hits_only=False):
+    """Log-odds grid from hit beams (points/origins, body frame per scan).
+
+    Free-space rule D (default when clear beams are given): clear_* are beams
+    that saw nothing within range (endpoint at the range limit, body frame).
+    They mark free space along their length but stop before any wall found by
+    the hit beams, so walls are never erased and nothing leaks through them.
+    hits_only=True (rule A) ignores them."""
     points, origins = np.asarray(points), np.asarray(origins)
     scan_ids, poses = np.asarray(scan_ids), np.asarray(poses)
+    use_clear = not hits_only and clear_points is not None and len(clear_points) > 0
+    if use_clear:
+        clear_points, clear_origins = np.asarray(clear_points), np.asarray(clear_origins)
+        clear_scan_ids = np.asarray(clear_scan_ids)
+        if (clear_points.ndim != 2 or clear_points.shape[1] != 2 or clear_origins.shape != clear_points.shape
+                or clear_scan_ids.shape != (len(clear_points),)
+                or not np.issubdtype(clear_scan_ids.dtype, np.integer)
+                or clear_scan_ids.min() < 0 or clear_scan_ids.max() >= len(poses)
+                or not (np.isfinite(clear_points).all() and np.isfinite(clear_origins).all())):
+            raise ValueError('Invalid clear-beam arrays')
     if (points.ndim != 2 or points.shape[1] != 2 or origins.shape != points.shape
             or scan_ids.shape != (len(points),) or poses.ndim != 2 or poses.shape[1] != 3
             or len(points) == 0 or len(poses) == 0):
@@ -53,39 +81,64 @@ def rasterize(points, origins, scan_ids, poses, resolution=.05, margin=.5,
     if not np.issubdtype(scan_ids.dtype, np.integer) or scan_ids.min() < 0 or scan_ids.max() >= len(poses):
         raise ValueError('Invalid scan IDs')
     # Vectorized local scan -> world projection; preserve sensor lever arms.
-    p = poses[scan_ids]
-    c, s = np.cos(p[:, 2]), np.sin(p[:, 2])
-    def world(values):
+    def world(values, ids):
+        p = poses[ids]
+        c, s = np.cos(p[:, 2]), np.sin(p[:, 2])
         return np.column_stack([c*values[:, 0]-s*values[:, 1]+p[:, 0],
                                 s*values[:, 0]+c*values[:, 1]+p[:, 1]])
-    endpoints, starts = world(points), world(origins)
-    extent = np.vstack([endpoints, starts, poses[:, :2]])
+    endpoints, starts = world(points, scan_ids), world(origins, scan_ids)
+    extent = [endpoints, starts, poses[:, :2]]
+    if use_clear:
+        clear_ends = world(clear_points, clear_scan_ids)
+        clear_starts = world(clear_origins, clear_scan_ids)
+        extent += [clear_ends, clear_starts]
+    extent = np.vstack(extent)
     origin = np.floor((extent.min(axis=0)-margin)/resolution)*resolution
     shape_xy = np.ceil((extent.max(axis=0)+margin-origin)/resolution).astype(np.int64)+1
     width, height = map(int, shape_xy)
     if width <= 0 or height <= 0 or width * height > max_cells:
         raise ValueError(f'Grid {width}x{height} exceeds {max_cells} cells; increase resolution or inspect pose outliers')
-    log_odds = np.zeros((height, width), dtype=np.float32)
-    observed = np.zeros((height, width), dtype=bool)
     endpoint_cells = np.floor((endpoints-origin)/resolution).astype(np.int64)
     start_cells = np.floor((starts-origin)/resolution).astype(np.int64)
-    # Apply at most one hit/miss per cell per scan; correlated zones/frames do
-    # not multiply confidence, and hits take priority over free rays in a scan.
-    order = np.argsort(scan_ids, kind='stable')
-    splits = np.flatnonzero(np.diff(scan_ids[order]))+1
-    for group in np.split(order, splits):
-        free, occupied = set(), set()
-        for index in group:
-            cells = list(line_cells(start_cells[index], endpoint_cells[index]))
-            free.update(cells[:-1]); occupied.add(cells[-1])
-        free.difference_update(occupied)
-        for cells, update in ((free, miss), (occupied, hit)):
-            if not cells:
-                continue
-            xy = np.asarray(list(cells), dtype=int)
-            x, y = xy[:, 0], xy[:, 1]
-            log_odds[y, x] = np.clip(log_odds[y, x] + update, -5., 5.)
-            observed[y, x] = True
+    hit_groups = {}
+    for index, sid in enumerate(scan_ids.tolist()):
+        hit_groups.setdefault(sid, []).append(index)
+    clear_groups = {}
+    if use_clear:
+        clear_end_cells = np.floor((clear_ends-origin)/resolution).astype(np.int64)
+        clear_start_cells = np.floor((clear_starts-origin)/resolution).astype(np.int64)
+        for index, sid in enumerate(clear_scan_ids.tolist()):
+            clear_groups.setdefault(sid, []).append(index)
+
+    def accumulate(blocked):
+        log_odds = np.zeros((height, width), dtype=np.float32)
+        observed = np.zeros((height, width), dtype=bool)
+        # Apply at most one hit/miss per cell per scan; correlated zones/frames do
+        # not multiply confidence, and hits take priority over free rays in a scan.
+        for sid in sorted(set(hit_groups) | set(clear_groups)):
+            free, occupied = set(), set()
+            for index in hit_groups.get(sid, ()):
+                cells = list(line_cells(start_cells[index], endpoint_cells[index]))
+                free.update(cells[:-1]); occupied.add(cells[-1])
+            if blocked is not None:
+                for index in clear_groups.get(sid, ()):
+                    cells = list(line_cells(clear_start_cells[index], clear_end_cells[index]))
+                    # Stop one cell before the first (dilated) wall cell
+                    stop = next((k for k, (x, y) in enumerate(cells) if blocked[y, x]), None)
+                    free.update(cells if stop is None else cells[:max(stop - 1, 0)])
+            free.difference_update(occupied)
+            for cells, update in ((free, miss), (occupied, hit)):
+                if not cells:
+                    continue
+                xy = np.asarray(list(cells), dtype=int)
+                x, y = xy[:, 0], xy[:, 1]
+                log_odds[y, x] = np.clip(log_odds[y, x] + update, -5., 5.)
+                observed[y, x] = True
+        return log_odds, observed
+
+    log_odds, observed = accumulate(None)          # rule A: hit beams only
+    if use_clear:                                  # rule D: walls from pass 1 block clear beams
+        log_odds, observed = accumulate(_dilate(log_odds > 0))
     return log_odds, observed, origin
 
 
@@ -139,6 +192,9 @@ def main(argv=None):
     ap.add_argument('--free-threshold', type=float, default=.196)
     ap.add_argument('--max-cells', type=int, default=4_000_000)
     ap.add_argument('--preview', action='store_true', help='Also write a PNG of the PGM raster')
+    ap.add_argument('--hits-only', action='store_true',
+                    help='Free space from hit beams only (rule A); default also clears along '
+                         'no-target beams, stopping at walls (rule D)')
     args = ap.parse_args(argv)
     values = (args.resolution, args.margin, args.hit_log_odds, args.miss_log_odds,
               args.occupied_threshold, args.free_threshold)
@@ -156,10 +212,17 @@ def main(argv=None):
                 raise ValueError('Unsupported SLAM result version')
             metadata = json.loads(str(result['metadata_json'].item()))
             poses = result['raw_poses' if args.raw else 'optimized_poses']
+            has_clear = 'clear_points' in result.files
+            clear = dict(clear_points=result['clear_points'], clear_origins=result['clear_origins'],
+                         clear_scan_ids=result['clear_scan_ids']) if has_clear else {}
             log_odds, observed, origin = rasterize(result['points'], result['origins'],
                 result['scan_ids'], poses, args.resolution, args.margin,
-                args.hit_log_odds, args.miss_log_odds, args.max_cells)
+                args.hit_log_odds, args.miss_log_odds, args.max_cells,
+                hits_only=args.hits_only, **clear)
+        rule = ('rule A: hit beams only' if args.hits_only or not has_clear else
+                'rule D: hit beams + no-target beams cleared to the range limit, stopping at walls')
         metadata = dict(result=str(args.result), trajectory='raw' if args.raw else 'optimized',
+                        free_space=rule,
                         geometry=metadata['geometry'], slam_status=metadata['status'],
                         graph_edges=metadata['edges'], hit_log_odds=args.hit_log_odds,
                         miss_log_odds=args.miss_log_odds)

@@ -53,10 +53,11 @@ static const char *TAG = "slam";
 static slam_icp_method_t s_icp_method = SLAM_ICP_POINT_TO_LINE;
 
 /* Default edge weights (see slam_set_weights). PX4's gyro heading is trusted
- * to ~1 deg per step, ICP to ~3 deg; ICP position (3 cm) is trusted more than
+ * to 0.1 deg per step, ICP to ~3 deg; ICP position (3 cm) is trusted more than
  * optical-flow odometry (8 cm). Chosen on host replays of the 2026-11-08
  * flights: ETH's 20x isotropic ICP weighting rotated the big-space maps 3-6 deg
- * away from PX4's (stable) heading. */
+ * away from PX4's (stable) heading, and 1 deg per step still let a few bad
+ * early loop closures rotate run16 by up to 3.8 deg. */
 static ls_slam_weights_t s_weights = SLAM_WEIGHTS_DEFAULT;
 static measurement s_odometry[GRAPH_MAX_POSES];
 static uint16_t s_line_rejects[ICP_LINE_HIGH_RMSE + 1];
@@ -178,11 +179,19 @@ static bool try_constraint(float poses[GRAPH_MAX_POSES][3], size_t ref, size_t c
     }
     icp_points_t *ref_cloud = (icp_points_t *)s_ref_buf;
     icp_points_t *cur_cloud = (icp_points_t *)s_cur_buf;
-    scan_extract_points(&s_ref_scan, poses[ref][0], poses[ref][1], poses[ref][2], ref_cloud);
-    scan_extract_points(&s_cur_scan, poses[cur][0], poses[cur][1], poses[cur][2], cur_cloud);
+    /* Run ICP in a frame centred on the reference pose. ICP rotates about the
+     * origin, so with points far from it (PX4's origin drifts with removed
+     * resets: ~77 m on 2026-11-13 run 2) rotation and translation become
+     * indistinguishable and point-to-line rejected every match. The
+     * constraint is relative, so the shift does not change it. */
+    const float ref_local[3] = {0.0f, 0.0f, poses[ref][2]};
+    const float cur_local[3] = {poses[cur][0] - poses[ref][0], poses[cur][1] - poses[ref][1],
+                                poses[cur][2]};
+    scan_extract_points(&s_ref_scan, ref_local[0], ref_local[1], ref_local[2], ref_cloud);
+    scan_extract_points(&s_cur_scan, cur_local[0], cur_local[1], cur_local[2], cur_cloud);
 
     constraint cons;
-    bool ok = comp_constr(ref_cloud, cur_cloud, poses[ref], poses[cur],
+    bool ok = comp_constr(ref_cloud, cur_cloud, ref_local, cur_local,
                           (int16_t)ref, (int16_t)cur, &cons);
     if (ok) {
         s_constraints[s_num_constraints] = cons;

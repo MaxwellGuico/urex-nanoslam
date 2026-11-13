@@ -32,6 +32,11 @@ experiment_xy_t experiment_waypoint(uint8_t mode, unsigned index, float length, 
     if (mode == 2) return experiment_corner(index, length, width);
     return (experiment_xy_t){0, 0};
 }
+experiment_xy_t experiment_rotate(experiment_xy_t body, float heading)
+{
+    const float c=cosf(heading), s=sinf(heading);
+    return (experiment_xy_t){body.x*c-body.y*s, body.x*s+body.y*c};
+}
 bool experiment_settled(float distance, float speed, float tolerance)
 { return distance <= tolerance && speed <= 0.08f; }
 experiment_xy_t experiment_step(experiment_xy_t current, experiment_xy_t goal,
