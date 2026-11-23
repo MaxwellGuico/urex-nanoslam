@@ -5,8 +5,12 @@ snapshot integrates PX4 MAVLink telemetry, an eight-sensor VL53L5CX ToF ring, Ap
 processing, Wi-Fi telemetry, and onboard NanoSLAM (ICP + pose-graph optimisation, ported from
 ETH NanoSLAM via Duncan Lau's ESP32-S3 firmware).
 
-> **Safety:** NanoSLAM is not flight-validated. It is read-only (it never sends setpoints and does
-> not feed navigation). Keep `CONFIG_BENCH_MODE=y` for props-off work.
+> **Status:** NanoSLAM has run onboard in flight. On 2026-11-13, drone 8 completed two 3 x 5 m
+> rectangle missions with onboard NanoSLAM and the 8x8 ToF ring at 15 Hz (runs 6 and 7; see
+> [`experiments/flight-tests-2026-11-13.md`](experiments/flight-tests-2026-11-13.md)).
+>
+> **Safety:** NanoSLAM is read-only: it never sends setpoints and does not feed navigation, so the
+> missions are flown on PX4's own estimate. Keep `CONFIG_BENCH_MODE=y` for props-off work.
 
 ## Repository layout
 
@@ -215,16 +219,19 @@ validity and distance matrices in [`papers/2309.12008.pdf`, PDF page 10](../../p
 This is research context, not a competition requirement. The index reported
 `missing-or-stale`; it was queried as-is without regenerating artifacts.
 
-## Latest bench logs
+## Flight and bench logs
 
-The preserved logs are indexed in [`experiments/README.md`](experiments/README.md#preserved-log-index).
+Flight tests, fixes and lessons from 2026-11-13 are in
+[`experiments/flight-tests-2026-11-13.md`](experiments/flight-tests-2026-11-13.md). Run 6 produced
+an onboard SLAM map of the room with 31/59 consecutive scan matches and 16/35 loop closures accepted.
+
+Bench logs are indexed in [`experiments/README.md`](experiments/README.md#preserved-log-index).
 Power conditions are explicit in the directory names:
 
 - `experiments/with-external-tof-power/`
 - `experiments/without-external-tof-power/`
 
-The logs are evidence from props-off development runs, including failures. They are not proof that
-the firmware is ready for flight.
+The bench logs are from props-off development runs, including failures.
 
 ## Review focus
 
